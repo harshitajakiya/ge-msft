@@ -1,8 +1,8 @@
 # PowerPoint: "Whole deck" attach — speed, mixed content, tables
 
 **Status:** done and tested locally. PowerPoint web confirmed the speed and mixed-content fixes on
-real decks. Table reading is covered by unit tests and still needs a check in PowerPoint. Not yet
-committed.
+real decks. Table reading is covered by unit tests and still needs a check in PowerPoint. On branch
+`fix/powerpoint-whole-deck-attach`.
 
 **Scope:** PowerPoint only. All changes are in the PowerPoint bridge.
 

@@ -217,6 +217,116 @@ describe('AssistSession — the reusable loop', () => {
     expect(session.context.size).toBe(0);
   });
 
+  it('detaches every chunk a PowerPoint ref resolved to, and replaces stale chunks on re-attach', async () => {
+    let chunks = 3;
+    const deck: ContextRef = {
+      id: 'pp:deck',
+      kind: 'document',
+      surface: 'powerpoint',
+      title: 'Whole deck',
+    };
+    const bridge: DocBridge = {
+      surface: 'powerpoint',
+      getCapabilities: () => ({
+        surface: 'powerpoint',
+        contextKinds: ['document'],
+        actuations: [],
+      }),
+      listContext: () => Promise.resolve([deck]),
+      resolveContext: (ref) =>
+        Promise.resolve(
+          Array.from({ length: chunks }, (_, i) => ({
+            ref: { ...ref, id: `${ref.id}#${i}`, kind: 'paragraph' as const },
+            value: { as: 'text' as const, text: `Slide ${i + 1}`, mimeType: 'text/markdown' },
+          })),
+        ),
+      actuate: (request) =>
+        Promise.resolve({ ok: true, changeId: request.changeId, kind: request.kind }),
+    };
+    const client = new StreamAssistClient(tokens, cfg, geminiFetch() as never);
+    const session = new AssistSession(bridge, client, { unit });
+
+    await session.attachRef(deck);
+    expect(session.context.list().map((c) => c.ref.id)).toEqual([
+      'pp:deck#0',
+      'pp:deck#1',
+      'pp:deck#2',
+    ]);
+
+    // The deck shrank: re-attaching must not leave the old third chunk behind.
+    chunks = 2;
+    await session.attachRef(deck);
+    expect(session.context.list().map((c) => c.ref.id)).toEqual(['pp:deck#0', 'pp:deck#1']);
+
+    session.detach('pp:deck');
+    expect(session.context.size).toBe(0);
+
+    // The auto-attach path records its chunks the same way.
+    await session.attachContext(['document']);
+    expect(session.context.size).toBe(2);
+    session.detach('pp:deck');
+    expect(session.context.size).toBe(0);
+  });
+
+  it('detaches every chunk on any surface (Word whole document)', async () => {
+    const doc: ContextRef = {
+      id: 'word:document',
+      kind: 'document',
+      surface: 'word',
+      title: 'Whole document',
+    };
+    const bridge = new FakeBridge();
+    bridge.resolveContext = (ref) =>
+      Promise.resolve(
+        [0, 1].map((i) => ({
+          ref: { ...ref, id: `${ref.id}#${i}`, kind: 'paragraph' as const },
+          value: { as: 'text' as const, text: `Section ${i + 1}`, mimeType: 'text/markdown' },
+        })),
+      );
+    const client = new StreamAssistClient(tokens, cfg, geminiFetch() as never);
+    const session = new AssistSession(bridge, client, { unit });
+
+    await session.attachRef(doc);
+    expect(session.context.size).toBe(2);
+    session.detach('word:document');
+    expect(session.context.size).toBe(0);
+  });
+
+  it('keeps a part another attached ref still claims (refs resolving to the same item)', async () => {
+    // Outlook-style: every ref resolves to the one active mail item, under the same id.
+    const mailItem: ContextRef = {
+      id: 'ol:item',
+      kind: 'mail-item',
+      surface: 'outlook',
+      title: 'Mail',
+    };
+    const thread: ContextRef = {
+      id: 'ol:thread',
+      kind: 'mail-thread',
+      surface: 'outlook',
+      title: 'Thread',
+    };
+    const bridge = new FakeBridge();
+    bridge.resolveContext = () =>
+      Promise.resolve([
+        {
+          ref: { id: 'ol:item#0', kind: 'paragraph', surface: 'outlook', title: 'Mail' },
+          value: { as: 'text', text: 'Quarterly numbers attached.', mimeType: 'text/markdown' },
+        },
+      ]);
+    const client = new StreamAssistClient(tokens, cfg, geminiFetch() as never);
+    const session = new AssistSession(bridge, client, { unit });
+
+    await session.attachRef(mailItem);
+    await session.attachRef(thread);
+    expect(session.context.size).toBe(1);
+
+    session.detach('ol:item');
+    expect(session.context.list().map((c) => c.ref.id)).toEqual(['ol:item#0']);
+    session.detach('ol:thread');
+    expect(session.context.size).toBe(0);
+  });
+
   it('resumes a prior session id (cross-surface / reopen)', () => {
     const bridge = new FakeBridge();
     const client = new StreamAssistClient(tokens, cfg, geminiFetch() as never);

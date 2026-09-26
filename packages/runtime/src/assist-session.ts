@@ -605,6 +605,14 @@ export class AssistSession {
 
   readonly context = new SessionContext();
   private readonly attachmentVersions = new Map<string, number>();
+  /**
+   * The resolved-context ids each attached ref added. Content is chunked, so a ref like `pp:deck`
+   * or `word:document` lands as `…#0`, `…#1`, … and removing the ref id alone left its chunks
+   * attached. Two refs can resolve to the same ids (an Excel selection and a range over the same
+   * cells; every Outlook/OneNote/Teams ref resolves to the one active item), so a part is only
+   * removed once no other attached ref still claims it.
+   */
+  private readonly attachedParts = new Map<string, Set<string>>();
   private readonly workspace = new WorkspaceStore();
   private readonly docFs: DocFs;
   /** The event-fed constructor of the working-context brief (see context-model.ts). */
@@ -826,31 +834,55 @@ export class AssistSession {
     const refs = await this.toolOperation('context:list', {}, () => this.bridge.listContext());
     const chosen = want ? refs.filter((r) => want.includes(r.kind)) : refs;
     for (const ref of chosen) {
-      for (const resolved of await this.toolOperation('context:resolve', { ref }, () =>
+      const resolvedParts = await this.toolOperation('context:resolve', { ref }, () =>
         this.bridge.resolveContext(ref),
-      )) {
-        this.context.add(resolved);
-      }
+      );
+      this.releaseAttachedParts(ref.id);
+      for (const resolved of resolvedParts) this.addAttachedPart(ref.id, resolved);
     }
     return chosen;
   }
 
-  /** Detach an attached context object by ref id. */
+  /** Detach an attached context object by ref id, including every chunk it resolved to. */
   detach(id: string): void {
     this.attachmentVersions.set(id, (this.attachmentVersions.get(id) ?? 0) + 1);
-    this.context.remove(id);
+    this.releaseAttachedParts(id);
+    if (!this.isClaimedByAttachedRef(id)) this.context.remove(id);
   }
 
   /** Attach one specific ref (resolve → add). Backs the context tray's attach-by-chip. */
   async attachRef(ref: ContextRef): Promise<void> {
     const version = (this.attachmentVersions.get(ref.id) ?? 0) + 1;
     this.attachmentVersions.set(ref.id, version);
-    for (const resolved of await this.toolOperation('context:resolve', { ref }, () =>
+    const resolvedParts = await this.toolOperation('context:resolve', { ref }, () =>
       this.bridge.resolveContext(ref),
-    )) {
-      if (this.attachmentVersions.get(ref.id) !== version) return;
-      this.context.add(resolved);
+    );
+    if (this.attachmentVersions.get(ref.id) !== version) return;
+    // A re-attach replaces the previous resolution: a deck that shrank must not keep stale chunks.
+    this.releaseAttachedParts(ref.id);
+    for (const resolved of resolvedParts) this.addAttachedPart(ref.id, resolved);
+  }
+
+  private addAttachedPart(refId: string, resolved: ResolvedContext): void {
+    this.context.add(resolved);
+    const parts = this.attachedParts.get(refId) ?? new Set<string>();
+    parts.add(resolved.ref.id);
+    this.attachedParts.set(refId, parts);
+  }
+
+  /** Forget a ref's parts and remove each one from context unless another attached ref claims it. */
+  private releaseAttachedParts(refId: string): void {
+    const parts = this.attachedParts.get(refId);
+    if (!parts) return;
+    this.attachedParts.delete(refId);
+    for (const partId of parts) {
+      if (!this.isClaimedByAttachedRef(partId)) this.context.remove(partId);
     }
+  }
+
+  private isClaimedByAttachedRef(partId: string): boolean {
+    for (const parts of this.attachedParts.values()) if (parts.has(partId)) return true;
+    return false;
   }
 
   /**
