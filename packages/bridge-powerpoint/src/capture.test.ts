@@ -9,10 +9,23 @@ import {
   searchSlides,
   parseSlideSelector,
   MAX_SEARCH_SLIDES,
+  tableValuesToText,
   type SlideElement,
 } from './capture.js';
 
 describe('powerpoint capture (pure)', () => {
+  it('flattens a table grid into one line per row, dropping blank rows', () => {
+    expect(
+      tableValuesToText([
+        ['Site', 'Budget'],
+        ['Madrid', ' $310K\r\n(approved) '],
+        ['', '  '],
+        ['Total', '$830K'],
+      ]),
+    ).toBe('Site | Budget\nMadrid | $310K (approved)\nTotal | $830K');
+    expect(tableValuesToText([])).toBe('');
+  });
+
   it('splits shape texts into a title and body lines', () => {
     const { title, body } = shapesToSlideText([
       'SLA & Availability',

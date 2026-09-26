@@ -54,6 +54,19 @@ export function shapesToSlideText(shapeTexts: string[]): { title: string; body: 
   return { title, body: lines.slice(1) };
 }
 
+/**
+ * A native table's cell grid (`Table.values`) → one text line per row, cells joined by ` | `, so it
+ * flows through {@link shapesToSlideText} like any other shape text. Line breaks inside a cell
+ * become spaces (a row must stay one line); rows whose cells are all blank are dropped.
+ */
+export function tableValuesToText(values: string[][]): string {
+  return values
+    .map((row) => row.map((cell) => (cell ?? '').replace(/\s+/g, ' ').trim()))
+    .filter((row) => row.some((cell) => cell.length > 0))
+    .map((row) => row.join(' | '))
+    .join('\n');
+}
+
 /** Turn captured slides into native blocks via the `native.slide()` builder. */
 export function slideElementsToBlocks(slides: SlideElement[]): Block[] {
   const blocks: Block[] = [];

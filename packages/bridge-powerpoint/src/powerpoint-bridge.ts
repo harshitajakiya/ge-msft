@@ -24,6 +24,7 @@ import {
   shapesToSlideText,
   slideElementsToDocStateBlocks,
   slidesToContext,
+  tableValuesToText,
   type SlideElement,
 } from './capture.js';
 import { planInsertSlide } from './actuate-plan.js';
@@ -141,17 +142,8 @@ export class PowerPointBridge implements DocBridge {
         return selectedSlideToContext(element);
       });
     }
-    // Whole deck → each slide's shapes + (best-effort) speaker notes → native blocks → chunks.
-    return PowerPoint.run(async (ctx) => {
-      const slides = ctx.presentation.slides;
-      slides.load('items/id,items/index');
-      await ctx.sync();
-      const elements: SlideElement[] = [];
-      for (const slide of slides.items) {
-        elements.push(await readSlide(ctx, slide));
-      }
-      return slidesToContext('pp:deck', 'Whole deck', elements);
-    });
+    // Whole deck → each slide's shape text → native blocks → chunks (bounded, batched read).
+    return slidesToContext('pp:deck', 'Whole deck', await this.readAllSlides());
   }
 
   /** Monotonic `<doc_state>` version, bumped on each capture (ADR-0003 Layer B element 1). */
@@ -229,19 +221,15 @@ export class PowerPointBridge implements DocBridge {
 
   /**
    * Read up to {@link MAX_READ_SLIDES} slides of the deck into pure {@link SlideElement}s — the
-   * shared host read behind `captureDocState`/`searchDocument`. Bounded so a huge deck can't blow
-   * the per-turn budget; read-only (loads shape text, writes nothing).
+   * shared host read behind the whole-deck context, `captureDocState` and `searchDocument`. Bounded
+   * so a huge deck can't blow the per-turn budget; read-only (loads shape text, writes nothing).
    */
   private async readAllSlides(): Promise<SlideElement[]> {
     return PowerPoint.run(async (ctx) => {
       const slides = ctx.presentation.slides;
       slides.load('items/id,items/index');
       await ctx.sync();
-      const elements: SlideElement[] = [];
-      for (const slide of slides.items.slice(0, MAX_READ_SLIDES)) {
-        elements.push(await readSlide(ctx, slide));
-      }
-      return elements;
+      return readSlides(ctx, slides.items.slice(0, MAX_READ_SLIDES));
     });
   }
 
@@ -905,36 +893,162 @@ function prefixedValue(value: string | undefined, ...prefixes: string[]): string
   return undefined;
 }
 
+/**
+ * Shape types whose `textFrame` is readable. Per the typings, `Shape.textFrame` throws
+ * `InvalidArgument` for a shape without one (image, table, chart, group, media, ...), and a throw
+ * fails the whole batched sync — so only these types are asked for text.
+ */
+const TEXT_SHAPE_TYPES: ReadonlySet<string> = new Set([
+  'GeometricShape',
+  'TextBox',
+  'Placeholder',
+  'Callout',
+  'Freeform',
+]);
+
+/**
+ * Shapes whose content is read: text-frame shapes, plus native tables (via `Table.values`,
+ * PowerPointApi 1.8) where the host supports them. Pictures and charts have no text API.
+ */
+function isReadableShape(shape: PowerPoint.Shape): boolean {
+  if (shape.type === 'Table') return isSet('PowerPointApi', '1.8');
+  return TEXT_SHAPE_TYPES.has(shape.type);
+}
+
+/**
+ * A placeholder reports `type: 'Placeholder'` whatever it holds; one filled with a picture, table
+ * or chart has no text frame. `placeholderFormat.containedType` (PowerPointApi 1.8) is `null` for an
+ * empty or text placeholder, else the contained shape's type.
+ */
+function placeholderHoldsText(containedType: string | null | undefined): boolean {
+  return (
+    containedType === null ||
+    containedType === undefined ||
+    (containedType !== 'Placeholder' && TEXT_SHAPE_TYPES.has(containedType))
+  );
+}
+
 /** Read one slide's shapes' text (+ id/index) into a pure {@link SlideElement}. */
 async function readSlide(
   ctx: PowerPoint.RequestContext,
   slide: PowerPoint.Slide,
 ): Promise<SlideElement> {
-  const shapes = slide.shapes;
-  shapes.load('items/id');
-  slide.load('id,index');
+  const [element] = await readSlides(ctx, [slide]);
+  if (!element) throw new Error('PowerPoint slide read returned no slide.');
+  return element;
+}
+
+/**
+ * Read slides' shape text in a constant number of host round-trips (at most three syncs, whatever
+ * the slide count). Each sync is a full round-trip on PowerPoint for the web (~0.85s measured), so a
+ * per-slide sync loop made a 9-slide whole-deck attach take ~16s; batched, the same read takes ~1.5s.
+ */
+async function readSlides(
+  ctx: PowerPoint.RequestContext,
+  slides: PowerPoint.Slide[],
+): Promise<SlideElement[]> {
+  if (slides.length === 0) return [];
+  const shapeCollections = slides.map((slide) => {
+    slide.load('id,index');
+    const shapes = slide.shapes;
+    shapes.load('items/id,items/type');
+    return shapes;
+  });
   await ctx.sync();
 
-  const ranges: PowerPoint.TextRange[] = [];
-  for (const shape of shapes.items) {
-    const range = shape.textFrame.textRange;
-    range.load('text');
-    ranges.push(range);
+  const candidates = shapeCollections.flatMap((shapes) => shapes.items.filter(isReadableShape));
+  const readable = await withoutNonTextPlaceholders(ctx, candidates);
+  const texts = await readShapeContent(ctx, readable);
+
+  return slides.map((slide, slideIndex) => {
+    const shapes = shapeCollections[slideIndex]?.items ?? [];
+    const shapeTexts = shapes.map((shape) => texts.get(shape) ?? '');
+    const { title, body } = shapesToSlideText(shapeTexts);
+    return {
+      index: slide.index,
+      slideId: slide.id,
+      title,
+      body,
+      shapes: shapes.map((shape, index) => ({
+        shapeId: shape.id,
+        text: shapeTexts[index] ?? '',
+      })),
+    };
+  });
+}
+
+/**
+ * Drop placeholders holding a picture/table/chart (one sync, only when the batch has placeholders).
+ * Without PowerPointApi 1.8, or if the host refuses the lookup, placeholders are kept and
+ * {@link readShapeContent}'s per-shape fallback skips any that throw.
+ */
+async function withoutNonTextPlaceholders(
+  ctx: PowerPoint.RequestContext,
+  shapes: PowerPoint.Shape[],
+): Promise<PowerPoint.Shape[]> {
+  const placeholders = shapes.filter((shape) => shape.type === 'Placeholder');
+  if (placeholders.length === 0 || !isSet('PowerPointApi', '1.8')) return shapes;
+  try {
+    const formats = new Map(
+      placeholders.map((shape) => {
+        const format = shape.placeholderFormat;
+        format.load('containedType');
+        return [shape, format] as const;
+      }),
+    );
+    await ctx.sync();
+    return shapes.filter((shape) => {
+      const format = formats.get(shape);
+      return !format || placeholderHoldsText(format.containedType);
+    });
+  } catch {
+    return shapes;
   }
-  await ctx.sync();
+}
 
-  const shapeTexts = ranges.map((r) => r.text ?? '');
-  const { title, body } = shapesToSlideText(shapeTexts);
-  return {
-    index: slide.index,
-    slideId: slide.id,
-    title,
-    body,
-    shapes: shapes.items.map((shape, index) => ({
-      shapeId: shape.id,
-      text: shapeTexts[index] ?? '',
-    })),
-  };
+/**
+ * Queue a read of one shape's content: a table's cell grid, else its text frame. Returns a getter to
+ * call after the next `ctx.sync()`.
+ */
+function queueShapeRead(shape: PowerPoint.Shape): () => string {
+  if (shape.type === 'Table') {
+    const table = shape.getTable();
+    table.load('values');
+    return () => tableValuesToText(table.values ?? []);
+  }
+  const range = shape.textFrame.textRange;
+  range.load('text');
+  return () => range.text ?? '';
+}
+
+/**
+ * Read `shapes`' content (text frames and tables) in one sync. A single shape the host refuses
+ * fails the whole batch, so on failure fall back to one sync per shape and skip the refusals —
+ * slower, but one unexpected shape can't block the read of the rest of the deck.
+ */
+async function readShapeContent(
+  ctx: PowerPoint.RequestContext,
+  shapes: PowerPoint.Shape[],
+): Promise<Map<PowerPoint.Shape, string>> {
+  const texts = new Map<PowerPoint.Shape, string>();
+  if (shapes.length === 0) return texts;
+  try {
+    const reads = shapes.map((shape) => [shape, queueShapeRead(shape)] as const);
+    await ctx.sync();
+    for (const [shape, read] of reads) texts.set(shape, read());
+    return texts;
+  } catch {
+    for (const shape of shapes) {
+      try {
+        const read = queueShapeRead(shape);
+        await ctx.sync();
+        texts.set(shape, read());
+      } catch {
+        // Nothing readable on this shape: leave it empty.
+      }
+    }
+    return texts;
+  }
 }
 
 async function readShapeContext(
@@ -944,15 +1058,15 @@ async function readShapeContext(
   const slide = ctx.presentation.slides.getItem(target.slideId);
   slide.load('id,index');
   const shape = slide.shapes.getItemOrNullObject(target.shapeId ?? '');
-  shape.load('id,isNullObject');
+  shape.load('id,isNullObject,type');
   await ctx.sync();
-  if (shape.isNullObject || !target.shapeId) return [];
-  const range = shape.textFrame.textRange;
-  range.load('text');
-  await ctx.sync();
+  if (shape.isNullObject || !target.shapeId || !isReadableShape(shape)) return [];
+  const [readable] = await withoutNonTextPlaceholders(ctx, [shape]);
+  if (!readable) return [];
+  const texts = await readShapeContent(ctx, [readable]);
   return selectedShapeToContext(
     { index: slide.index, slideId: slide.id },
-    { shapeId: shape.id, text: range.text ?? '' },
+    { shapeId: shape.id, text: texts.get(readable) ?? '' },
   );
 }
 

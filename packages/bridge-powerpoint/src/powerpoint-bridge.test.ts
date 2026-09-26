@@ -24,6 +24,12 @@ import { MAX_READ_SLIDES, PowerPointBridge } from './powerpoint-bridge.js';
 
 interface ShapeSeed {
   text: string;
+  /** Simulated `Shape.type`; defaults to 'TextBox'. */
+  type?: string;
+  /** Simulated `placeholderFormat.containedType` for a 'Placeholder' shape (null = text/empty). */
+  containedType?: string | null;
+  /** The host refuses this shape's text frame even though its type suggests one. */
+  refuseText?: boolean;
   /** Simulated ShapeFill.foregroundColor (undefined until first set). */
   fillColor?: string;
   /** Simulated ShapeLineFormat.color (undefined until first set). */
@@ -80,6 +86,12 @@ class FakeTableCell {
 /** A simulated native table whose storage is the owning shape's `tableGrid` seed. */
 class FakeTable {
   constructor(private readonly shape: ShapeSeed) {}
+  load(_p?: string): this {
+    return this;
+  }
+  get values(): string[][] {
+    return (this.shape.tableGrid ?? []).map((row) => [...row]);
+  }
   getCellOrNullObject(rowIndex: number, columnIndex: number): FakeTableCell {
     const grid = (this.shape.tableGrid ??= []);
     while (grid.length <= rowIndex) grid.push([]);
@@ -175,8 +187,23 @@ class FakeShapeLineFormat {
   }
 }
 
+/** Shape types the simulated host gives a text frame (mirrors the host's InvalidArgument throw). */
+const FAKE_TEXT_SHAPE_TYPES = new Set([
+  'GeometricShape',
+  'TextBox',
+  'Placeholder',
+  'Callout',
+  'Freeform',
+]);
+
+/**
+ * Like the real host, touching a text frame / placeholder format the shape doesn't have queues an
+ * operation that fails at the NEXT `ctx.sync()` — failing the whole batch, not just that shape.
+ */
+let pendingHostError: string | undefined;
+
 class FakeShape {
-  readonly textFrame: { textRange: FakeTextRange };
+  private readonly frame: { textRange: FakeTextRange };
   readonly fill: FakeShapeFill;
   readonly lineFormat: FakeShapeLineFormat;
   constructor(
@@ -184,9 +211,31 @@ class FakeShape {
     readonly id: string,
     readonly isNullObject = false,
   ) {
-    this.textFrame = { textRange: new FakeTextRange(shape) };
+    this.frame = { textRange: new FakeTextRange(shape) };
     this.fill = new FakeShapeFill(shape);
     this.lineFormat = new FakeShapeLineFormat(shape);
+  }
+  get type(): string {
+    return this.shape.type ?? 'TextBox';
+  }
+  get textFrame(): { textRange: FakeTextRange } {
+    const contained = this.shape.containedType;
+    const refuses =
+      this.shape.refuseText === true ||
+      !FAKE_TEXT_SHAPE_TYPES.has(this.type) ||
+      (this.type === 'Placeholder' && contained != null && !FAKE_TEXT_SHAPE_TYPES.has(contained));
+    if (refuses) pendingHostError = `InvalidArgument: ${this.type} ${this.id} has no TextFrame`;
+    return this.frame;
+  }
+  get placeholderFormat(): { containedType: string | null; load(_p?: string): unknown } {
+    if (this.type !== 'Placeholder') {
+      pendingHostError = `GeneralException: ${this.id} is not a placeholder`;
+    }
+    const format = {
+      containedType: this.shape.containedType ?? null,
+      load: () => format,
+    };
+    return format;
   }
   load(_p?: string): this {
     return this;
@@ -195,6 +244,7 @@ class FakeShape {
     (this.shape.zOrderCalls ??= []).push(position);
   }
   getTable(): FakeTable {
+    if (this.type !== 'Table') pendingHostError = `InvalidArgument: ${this.id} is not a table`;
     return new FakeTable(this.shape);
   }
 }
@@ -271,7 +321,7 @@ class FakeShapeCollection {
     const grid: string[][] = Array.from({ length: rowCount }, () =>
       Array.from({ length: columnCount }, () => ''),
     );
-    return this.append({ text: '', tableGrid: grid, zOrderCalls: [] });
+    return this.append({ text: '', type: 'Table', tableGrid: grid, zOrderCalls: [] });
   }
 }
 
@@ -368,7 +418,9 @@ class FakeContext {
   }
   sync(): Promise<void> {
     this.syncs += 1;
-    return Promise.resolve();
+    const error = pendingHostError;
+    pendingHostError = undefined;
+    return error ? Promise.reject(new Error(error)) : Promise.resolve();
   }
 }
 
@@ -402,6 +454,7 @@ function install(seed: DeckSeed, opts: InstallOpts = {}): Installed {
   const ctxRef: { ctx?: FakeContext } = {};
   const office: OfficeRegistry = { added: [], removed: [] };
 
+  pendingHostError = undefined;
   const prevPP = (globalThis as Record<string, unknown>).PowerPoint;
   const prevOffice = (globalThis as Record<string, unknown>).Office;
 
@@ -518,6 +571,17 @@ const SAMPLE_SLIDES: SlideSeed[] = [
     ],
   },
 ];
+
+const WHOLE_DECK: ContextRef = {
+  id: 'pp:deck',
+  kind: 'document',
+  surface: 'powerpoint',
+  title: 'Whole deck',
+};
+
+function contextText(ctx: Array<{ value: { as: string; text?: string } }>): string {
+  return ctx.map((c) => (c.value.as === 'text' ? (c.value.text ?? '') : '')).join('\n');
+}
 
 /* ───────────────────────────── getCapabilities ───────────────────────────── */
 
@@ -654,6 +718,218 @@ describe('PowerPointBridge.resolveContext', () => {
     expect(locators).toContain('slide:s1');
     expect(locators).toContain('slide:s2');
     expect(locators).toContain('slide:s3');
+  });
+
+  it('reads the whole deck in a constant number of syncs, whatever the slide count', async () => {
+    const wholeDeck: ContextRef = {
+      id: 'pp:deck',
+      kind: 'document',
+      surface: 'powerpoint',
+      title: 'Whole deck',
+    };
+    const slides = (count: number): SlideSeed[] =>
+      Array.from({ length: count }, (_, i) => ({
+        id: `s${i}`,
+        shapes: [
+          { text: `Title ${i}`, zOrderCalls: [] },
+          { text: `Body ${i}`, zOrderCalls: [] },
+        ],
+      }));
+
+    installed = install(deck(slides(3)));
+    await new PowerPointBridge().resolveContext(wholeDeck);
+    const small = installed.ctxRef.ctx?.syncs;
+    installed.restore();
+
+    installed = install(deck(slides(30)));
+    const ctx = await new PowerPointBridge().resolveContext(wholeDeck);
+    expect(installed.ctxRef.ctx?.syncs).toBe(small);
+    expect(small).toBeLessThanOrEqual(3);
+    expect(ctx.map((c) => c.value.as === 'text' && c.value.text).join('\n')).toContain('Body 29');
+  });
+
+  it('skips shapes without a text frame instead of failing the whole-deck read', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Deck title', zOrderCalls: [] },
+            { text: '', type: 'Image', zOrderCalls: [] },
+            { text: '', type: 'Table', zOrderCalls: [] },
+          ],
+        },
+        { id: 's2', shapes: [{ text: 'Second slide', zOrderCalls: [] }] },
+      ]),
+    );
+    const ctx = await new PowerPointBridge().resolveContext({
+      id: 'pp:deck',
+      kind: 'document',
+      surface: 'powerpoint',
+      title: 'Whole deck',
+    });
+    const text = ctx.map((c) => (c.value.as === 'text' ? c.value.text : '')).join('\n');
+    expect(text).toContain('Deck title');
+    expect(text).toContain('Second slide');
+  });
+
+  it('skips a placeholder holding a picture without falling back to per-shape reads', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Offsite', type: 'Placeholder', containedType: null, zOrderCalls: [] },
+            { text: '', type: 'Placeholder', containedType: 'Image', zOrderCalls: [] },
+            { text: 'Lisbon, 8-10 October', type: 'Placeholder', zOrderCalls: [] },
+          ],
+        },
+        { id: 's2', shapes: [{ text: 'Next slide', zOrderCalls: [] }] },
+      ]),
+    );
+    const ctx = await new PowerPointBridge().resolveContext(WHOLE_DECK);
+    const text = contextText(ctx);
+    expect(text).toContain('Offsite');
+    expect(text).toContain('Lisbon, 8-10 October');
+    expect(text).toContain('Next slide');
+    // slides + shapes + placeholder formats + text: the batch path, no per-shape retries.
+    expect(installed.ctxRef.ctx?.syncs).toBe(4);
+  });
+
+  it('falls back to per-shape reads when the host refuses an unexpected shape', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Kept title', zOrderCalls: [] },
+            { text: 'secret', type: 'GeometricShape', refuseText: true, zOrderCalls: [] },
+            { text: 'Kept body', zOrderCalls: [] },
+          ],
+        },
+      ]),
+    );
+    const text = contextText(await new PowerPointBridge().resolveContext(WHOLE_DECK));
+    expect(text).toContain('Kept title');
+    expect(text).toContain('Kept body');
+    expect(text).not.toContain('secret');
+  });
+
+  it('still reads the deck on a host without placeholderFormat (PowerPointApi < 1.8)', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Old host title', type: 'Placeholder', zOrderCalls: [] },
+            { text: '', type: 'Placeholder', containedType: 'Image', zOrderCalls: [] },
+          ],
+        },
+      ]),
+      { requirements: { PowerPointApi: 1.5 } },
+    );
+    const text = contextText(await new PowerPointBridge().resolveContext(WHOLE_DECK));
+    expect(text).toContain('Old host title');
+  });
+
+  it('reads native table cells into the whole deck, in the same round-trip as text', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Wave 3 site budgets', zOrderCalls: [] },
+            {
+              text: '',
+              type: 'Table',
+              tableGrid: [
+                ['Site', 'Budget'],
+                ['Madrid', '$310K'],
+                ['', ''],
+              ],
+              zOrderCalls: [],
+            },
+          ],
+        },
+      ]),
+    );
+    const text = contextText(await new PowerPointBridge().resolveContext(WHOLE_DECK));
+    expect(text).toContain('Site | Budget');
+    expect(text).toContain('Madrid | $310K');
+    // slides + shapes + content (text and tables together): no extra sync for tables.
+    expect(installed.ctxRef.ctx?.syncs).toBe(3);
+  });
+
+  it('skips tables on a host without Table.values (PowerPointApi < 1.8)', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Budgets', zOrderCalls: [] },
+            { text: '', type: 'Table', tableGrid: [['Madrid', '$310K']], zOrderCalls: [] },
+          ],
+        },
+      ]),
+      { requirements: { PowerPointApi: 1.5 } },
+    );
+    const text = contextText(await new PowerPointBridge().resolveContext(WHOLE_DECK));
+    expect(text).toContain('Budgets');
+    expect(text).not.toContain('Madrid');
+  });
+
+  it('resolves a table shape chip to its cells and a picture shape chip to nothing', async () => {
+    installed = install(
+      deck([
+        {
+          id: 's1',
+          shapes: [
+            { text: '', type: 'Image', zOrderCalls: [] },
+            {
+              text: '',
+              type: 'Table',
+              tableGrid: [
+                ['Aisle', 'Picks / hr'],
+                ['C-14', '312'],
+              ],
+              zOrderCalls: [],
+            },
+          ],
+        },
+      ]),
+    );
+    const shapeRef = (shapeId: string): ContextRef => ({
+      id: `pp:shape:s1:${shapeId}`,
+      kind: 'shape',
+      surface: 'powerpoint',
+      title: 'Shape',
+      hostRef: { type: 'powerpoint.shape', slideId: 's1', shapeId },
+    });
+    const bridge = new PowerPointBridge();
+    expect(await bridge.resolveContext(shapeRef('s1-shape-0'))).toEqual([]);
+    expect(contextText(await bridge.resolveContext(shapeRef('s1-shape-1')))).toContain(
+      'C-14 | 312',
+    );
+  });
+
+  it('bounds the whole-deck read to MAX_READ_SLIDES slides', async () => {
+    installed = install(
+      deck(
+        Array.from({ length: MAX_READ_SLIDES + 5 }, (_, i) => ({
+          id: `s${i}`,
+          shapes: [{ text: `Title ${i + 1}`, zOrderCalls: [] }],
+        })),
+      ),
+    );
+    const ctx = await new PowerPointBridge().resolveContext({
+      id: 'pp:deck',
+      kind: 'document',
+      surface: 'powerpoint',
+      title: 'Whole deck',
+    });
+    const text = ctx.map((c) => (c.value.as === 'text' ? c.value.text : '')).join('\n');
+    expect(text).toContain(`Title ${MAX_READ_SLIDES}`);
+    expect(text).not.toContain(`Title ${MAX_READ_SLIDES + 1}`);
   });
 });
 
