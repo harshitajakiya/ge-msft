@@ -13,8 +13,26 @@ Load this when the active surface is PowerPoint. Cross-surface table:
 [capability-map.md](capability-map.md).
 
 **Reading:** `read`/`outline` give the slides and their shapes. Write by slide index or by an existing
-shape ref. Use `list shape`, `properties <ref>`, `open <ref>`, and `inspect <ref>` to target one
-shape; do not parse a shape id out of slide text.
+shape ref. Use `read slide:<n>` (it lists each shape's id and type and marks the title),
+`list shape`, `properties <ref>`, `open <ref>`, and `inspect <ref>` to target one shape; do not
+guess a shape id from slide text.
+
+**Slide references (`slide=`):** a slide-targeted write (`/add-shape`, `/add-table-slide`) takes the
+slide id from `outline` (e.g. `slide=256#0`), a 1-based slide number (`slide=3`), or `slide=last` for
+the deck's last slide — including one a preceding `slide "Title" …` just added in the same plan (if
+that `slide` step fails, the `slide=last` write is skipped rather than landing on another slide). Do
+not invent ids such as `s2` or `new-slide`; an unknown reference fails with the list of valid
+slides. The one exception is `/add-table-slide slide=new title="…"`, which **creates** a new slide
+for the table.
+
+**Shape references:** shape commands name the slide and the shape: `shape pp:shape:1:title "FY26
+Plan"`, `/format-shape slide=1 shape=title fill=#0F6CBD fontColor=#FFFFFF`. The shape is its exact
+shape id or `title` (the slide's title placeholder, else its first text shape). There are no shape
+numbers: PowerPoint shape ids are small numbers themselves, so `2` always means id 2.
+Positions (`left`/`top`/`width`/`height`, in points) must stay inside the slide; an off-slide
+position fails with the slide's size.
+To put a title and bullets on a new slide, use `slide "Title" "bullet" …` alone: it writes into the
+layout's title/body placeholders, or adds text boxes when the layout has none.
 
 **Progressive disclosure:** specialized PowerPoint writes are live capability-gated. Use only slash
 commands advertised by the grammar/help for the turn, after `list`/`properties`/`open`/`inspect`
@@ -43,8 +61,9 @@ artifact.
   bounds before choosing coordinates.
 - `/format-shape` changes fill, line, text, size, or position on an inspected shape ref. Never infer
   the shape from visible text alone.
-- `/add-table-slide` creates a slide with structured table rows. Use this for table-native slides
-  instead of bullet text when the live grammar exposes it.
+- `/add-table-slide` adds a native table to a slide: `slide=new title="…"` creates a new slide for
+  it; `slide=<id|number|last>` adds it to an existing one. Use it for table-native content instead of
+  bullet text when the live grammar exposes it.
 - `/apply-slide-layout` applies a discovered layout name/id to a known slide. List available layouts
   first and fail closed if the host does not expose the requested layout.
 - `/insert-slide` with `deckBase64` is only for host-staged compiled deck artifacts; it is not a

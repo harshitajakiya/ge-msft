@@ -15,9 +15,10 @@
  *   - `Office.context.document.addHandlerAsync(...)` for selection/view events (shared Office fake).
  *
  * Fidelity notes / boundary:
- *   - A freshly `add()`ed slide is seeded with two empty placeholder shapes (title + body), matching
- *     the bridge's layout convention (`shapes.items[0]` = title, `[1]` = body). We do NOT model real
- *     slide layouts/masters — just enough shape structure for the native compose path to write into.
+ *   - A freshly `add()`ed slide is seeded with two empty placeholder shapes typed `Title` and `Body`
+ *     (`Shape.type` 'Placeholder' + `placeholderFormat.type`), as a "Title and Content" layout gives.
+ *     We do NOT model real slide layouts/masters — just enough shape structure for the native compose
+ *     path to write into.
  *   - `insertSlidesFromBase64` records the base64 payload and appends a marker slide; we do not parse
  *     PPTX bytes (out of scope — the bridge only needs the call to succeed).
  */
@@ -33,6 +34,10 @@ import {
 /** A shape on a slide: just its text frame's text (the only facet the bridge reads/writes). */
 export interface ShapeSeed {
   text: string;
+  /** `Shape.type`; defaults to 'TextBox'. */
+  type?: string;
+  /** `placeholderFormat.type` for a 'Placeholder' shape (e.g. 'Title', 'Body'). */
+  placeholderType?: string;
 }
 
 /** A slide: a stable id + its shapes (title shape first, by layout convention). */
@@ -77,6 +82,17 @@ class FakeShape {
   ) {
     this.textFrame = { textRange: new FakeTextRange(shape) };
   }
+  get type(): string {
+    return this.shape.type ?? 'TextBox';
+  }
+  get placeholderFormat(): { type: string; containedType: null; load(_props?: string): unknown } {
+    const format = {
+      type: this.shape.placeholderType ?? 'Unsupported',
+      containedType: null,
+      load: () => format,
+    };
+    return format;
+  }
 }
 
 class FakeShapeCollection {
@@ -86,6 +102,11 @@ class FakeShapeCollection {
   }
   load(_props?: string): this {
     return this;
+  }
+  getItemAt(index: number): FakeShape {
+    const shape = this.items[index];
+    if (!shape) throw new Error(`fake-powerpoint: no shape at index ${index}`);
+    return shape;
   }
 }
 
@@ -117,10 +138,13 @@ class FakeSlideCollection {
     return { value: this.seed.slides.length };
   }
   add(): void {
-    // A blank slide with two placeholder shapes (title + body), matching the bridge's convention.
+    // A new slide from a "Title and Content"-style layout: a title and a body placeholder.
     this.seed.slides.push({
       id: `sim-slide-${this.seed.slides.length + 1}`,
-      shapes: [{ text: '' }, { text: '' }],
+      shapes: [
+        { text: '', type: 'Placeholder', placeholderType: 'Title' },
+        { text: '', type: 'Placeholder', placeholderType: 'Body' },
+      ],
     });
     this.items = this.seed.slides.map((s, i) => new FakeSlide(s, i));
   }

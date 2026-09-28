@@ -7,7 +7,10 @@ import {
   slidesToContext,
   selectedSlideToContext,
   searchSlides,
+  mayNameSlide,
   parseSlideSelector,
+  slideIndexForSelector,
+  slideShapeListing,
   MAX_SEARCH_SLIDES,
   tableValuesToText,
   type SlideElement,
@@ -136,5 +139,56 @@ describe('powerpoint slide selector (pure)', () => {
     expect(parseSlideSelector('Agenda')).toBeUndefined();
     expect(parseSlideSelector('slide:0')).toBeUndefined(); // 1-based; 0 is invalid
     expect(parseSlideSelector('A1:B3')).toBeUndefined();
+  });
+});
+
+describe('slide selectors for read', () => {
+  const ids = ['256#', '257#', '300#'];
+
+  it('resolves host ids, pp:slide:/slide: refs, numbers and last', () => {
+    expect(slideIndexForSelector(ids, '257#')).toBe(1);
+    expect(slideIndexForSelector(ids, 'pp:slide:300#')).toBe(2);
+    expect(slideIndexForSelector(ids, 'slide:257#')).toBe(1);
+    expect(slideIndexForSelector(ids, 'slide 1')).toBe(0);
+    expect(slideIndexForSelector(ids, 'pp:slide:2')).toBe(1);
+    expect(slideIndexForSelector(ids, 'last')).toBe(2);
+    expect(slideIndexForSelector(ids, '4')).toBeUndefined();
+    expect(slideIndexForSelector(ids, 'Agenda')).toBeUndefined();
+    expect(slideIndexForSelector([], 'last')).toBeUndefined();
+  });
+
+  it('screens out selectors that cannot name a slide before any host call', () => {
+    expect(mayNameSlide('Agenda')).toBe(false);
+    expect(mayNameSlide('A1:B3')).toBe(false);
+    expect(mayNameSlide('slide:1')).toBe(true);
+    expect(mayNameSlide('pp:slide:256#')).toBe(true);
+    expect(mayNameSlide('256#')).toBe(true);
+    expect(mayNameSlide('last')).toBe(true);
+  });
+});
+
+describe('slideShapeListing', () => {
+  it('lists ids, types, the title and clipped single-line text', () => {
+    const lines = slideShapeListing({
+      index: 0,
+      slideId: '256#',
+      title: 'FY26 Plan',
+      body: [],
+      shapes: [
+        { shapeId: '2', text: 'FY26 Plan', type: 'Placeholder', isTitle: true },
+        { shapeId: '3', text: 'line one\nline two', type: 'TextBox' },
+        { shapeId: '4', text: 'x'.repeat(100) },
+      ],
+    });
+    expect(lines[0]).toBe(
+      'Shapes on slide 1 (for shape commands use slide=1 and shape=<id>; shape=title is id 2):',
+    );
+    expect(lines[1]).toBe('- id 2 · Placeholder · title · "FY26 Plan"');
+    expect(lines[2]).toBe('- id 3 · TextBox · "line one line two"');
+    expect(lines[3]).toBe(`- id 4 · "${'x'.repeat(80)}…"`);
+  });
+
+  it('is empty when the slide has no shapes', () => {
+    expect(slideShapeListing({ index: 0, title: '', body: [] })).toEqual([]);
   });
 });

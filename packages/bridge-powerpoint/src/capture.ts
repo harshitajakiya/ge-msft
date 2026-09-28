@@ -21,6 +21,10 @@ export interface ShapeElement {
   shapeId: string;
   /** Text read from the shape's text frame; empty for non-text shapes. */
   text: string;
+  /** Host shape type (`Placeholder`, `TextBox`, `GeometricShape`, `Image`, `Table`…), when read. */
+  type?: string;
+  /** True for the shape `shape=title` resolves to on this slide. */
+  isTitle?: boolean;
 }
 
 export interface SlideElement {
@@ -93,6 +97,34 @@ export function slidesToContext(
     blocks,
   };
   return toContextNative(content, opts);
+}
+
+/**
+ * The shape listing a single-slide `read` appends, so the model can address shape commands
+ * (`/format-shape slide=N shape=<id>`) without guessing ids. Shape text is document content: it is
+ * quoted, single-line and clipped, like any other grounding text.
+ */
+export function slideShapeListing(slide: SlideElement): string[] {
+  const shapes = slide.shapes ?? [];
+  if (shapes.length === 0) return [];
+  const title = shapes.find((shape) => shape.isTitle);
+  const header =
+    `Shapes on slide ${slide.index + 1} (for shape commands use slide=${slide.index + 1} and ` +
+    `shape=<id>${title ? `; shape=title is id ${title.shapeId}` : ''}):`;
+  return [
+    header,
+    ...shapes.map((shape) => {
+      const text = shape.text.replace(/\s+/g, ' ').trim();
+      return [
+        `- id ${shape.shapeId}`,
+        shape.type,
+        shape.isTitle ? 'title' : undefined,
+        text ? JSON.stringify(text.length > 80 ? `${text.slice(0, 80)}…` : text) : undefined,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+    }),
+  ];
 }
 
 /** A single selected slide → context (same mapping as `slidesToContext`). */
@@ -200,4 +232,31 @@ export function parseSlideSelector(selector: string): number | undefined {
   const oneBased = Number(m[1]);
   if (!Number.isInteger(oneBased) || oneBased < 1) return undefined;
   return oneBased - 1;
+}
+
+/**
+ * Whether a `read` selector could name a slide — `slide:`/`pp:slide:` refs, `last`, or a token with a
+ * digit (a slide number or host id such as `256#`). Checked BEFORE calling the host, so a name like
+ * `Agenda` degrades to `[]` without a round-trip.
+ */
+export function mayNameSlide(selector: string): boolean {
+  const key = selector.trim();
+  return /^(?:pp:)?slide\b/i.test(key) || /^last$/i.test(key) || /^[\w#-]*\d[\w#-]*$/.test(key);
+}
+
+/**
+ * Resolve a `read` selector against the deck's slide ids (in order): an exact host id (bare or as
+ * `slide:<id>` / `pp:slide:<id>`), `last`, else a 1-based slide number ({@link parseSlideSelector}).
+ * Ids win over numbers, matching the write path's slide resolution.
+ */
+export function slideIndexForSelector(
+  ids: readonly string[],
+  selector: string,
+): number | undefined {
+  const key = selector.trim().replace(/^(?:pp:)?slide[\s:]*/i, '');
+  const byId = ids.indexOf(key);
+  if (byId >= 0) return byId;
+  if (/^last$/i.test(key)) return ids.length > 0 ? ids.length - 1 : undefined;
+  const index = parseSlideSelector(key);
+  return index !== undefined && index < ids.length ? index : undefined;
 }

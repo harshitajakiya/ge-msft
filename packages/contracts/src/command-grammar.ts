@@ -1964,8 +1964,8 @@ function writeVerbSpec(verb: WriteVerb, isExcelLike: boolean): VerbSpec {
     case 'shape':
       return {
         verb: 'shape',
-        usage: 'shape <pp:shape:slideId:shapeId> "text"',
-        hint: 'replace text in one selected/addressed PowerPoint shape',
+        usage: 'shape <pp:shape:slide:shape> "text"',
+        hint: 'replace text in one PowerPoint shape, e.g. retitle a slide: shape pp:shape:1:title "New title" (slide = id, number or last; shape = id or title)',
       };
   }
 }

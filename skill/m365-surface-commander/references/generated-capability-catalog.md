@@ -42,8 +42,8 @@ This file is generated from `packages/contracts/src/capability-registry.ts`. Reg
 | outlook | implemented | `/set-subject` | `set-subject` | Outlook draft subject | Mailbox 1.1 | replace the subject of an open draft without sending |
 | powerpoint | catalog-only | `/apply-slide-layout` | `apply-slide-layout` | PowerPoint slide layout application | PowerPointApi 1.8 | apply an existing deck layout to a specific slide without recreating the slide |
 | powerpoint | implemented | `/add-shape` | `add-shape` | PowerPoint shape/textbox insertion | PowerPointApi 1.4 | add a text box, geometric shape, or line to an addressed slide with explicit geometry |
-| powerpoint | implemented | `/add-table-slide` | `add-table-slide` | PowerPoint native slide table | PowerPointApi 1.8 | insert a small native table onto a slide instead of flattening it into text |
-| powerpoint | implemented | `/format-shape` | `format-shape` | PowerPoint shape formatting | PowerPointApi 1.4 | change fill, line, font, or z-order for one addressed shape |
+| powerpoint | implemented | `/add-table-slide` | `add-table-slide` | PowerPoint native slide table | PowerPointApi 1.8 | add a native table (rows and columns) to a new slide (slide=new title="…") or an existing slide, instead of flattening the rows into bullet text |
+| powerpoint | implemented | `/format-shape` | `format-shape` | PowerPoint shape formatting | PowerPointApi 1.4 | change the colour of one addressed shape (fill/background, text colour, outline) or its font or z-order, e.g. make a title blue with white text |
 | powerpoint | implemented | `slide` | `insert-slide` | PowerPoint slide insertion | PowerPointApi 1.2 | add a grounded title-and-bullets slide to the active deck |
 | powerpoint | implemented | `shape` | `set-shape-text` | PowerPoint shape text replacement | PowerPointApi 1.4 | replace text in one addressed slide shape without rewriting the whole slide |
 | powerpoint | promotable | `/insert-image` | `insert-image` | PowerPoint image insertion | PowerPointApi 1.4 | place a generated or grounded image onto a slide as an image object |

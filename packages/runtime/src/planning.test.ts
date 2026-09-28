@@ -32,6 +32,76 @@ describe('planning — dependency DAG (ADR-0008 §7)', () => {
     expect(plan[2]!.dependsOn).toEqual(['e1']); // chart ← spill (NOT chart ← table)
   });
 
+  it('a PowerPoint slide=last write depends on a preceding insert-slide; an addressed one does not', () => {
+    const pp = (
+      kind: ActuationRequest['kind'],
+      params: ActuationRequest['params'],
+      id: string,
+    ) => ({
+      ...req(kind, params, id),
+      surface: 'powerpoint' as const,
+    });
+    const plan = analyseEffectDependencies([
+      pp('insert-slide', { slide: { title: 'Q4 plan', bullets: [] } }, 'c1'),
+      pp('add-shape', { target: { slideId: 'last' }, shape: { shapeType: 'textBox' } }, 'c2'),
+      pp(
+        'add-table-slide',
+        { target: { slideId: 'slide:LAST' }, tableGrid: { hasHeaders: false, rows: [['a']] } },
+        'c3',
+      ),
+    ]);
+    expect(plan[1]!.dependsOn).toEqual(['e1']);
+    expect(plan[2]!.dependsOn).toEqual(['e1']);
+    // So a failed/uncertain insert skips the slide=last writes instead of running them.
+    expect(propagateFailure(plan, 'e1').skipped).toEqual(['e2', 'e3']);
+
+    // A write to an exact slide id does not depend on the insert.
+    const addressed = analyseEffectDependencies([
+      pp('insert-slide', { slide: { title: 'Q4 plan', bullets: [] } }, 'c1'),
+      pp('add-shape', { target: { slideId: '256#0' }, shape: { shapeType: 'textBox' } }, 'c2'),
+    ]);
+    expect(addressed[1]!.dependsOn).toEqual([]);
+  });
+
+  it('ties every relative-slide PowerPoint write to the step that adds a slide', () => {
+    const pp = (
+      kind: ActuationRequest['kind'],
+      params: ActuationRequest['params'],
+      id: string,
+    ) => ({
+      ...req(kind, params, id),
+      surface: 'powerpoint' as const,
+    });
+    // insert-slide, then shape writes addressed at the last slide (incl. pp:slide:last).
+    const plan = analyseEffectDependencies([
+      pp('insert-slide', { slide: { title: 'Risks', bullets: [] } }, 'c1'),
+      pp('set-shape-text', { target: { slideId: 'last', shapeId: 'title' }, text: 'x' }, 'c2'),
+      pp(
+        'format-shape',
+        { target: { slideId: 'last', shapeId: 'title' }, shapeFormat: { fill: '#000' } },
+        'c3',
+      ),
+      pp(
+        'add-shape',
+        { target: { slideId: 'pp:slide:last' }, shape: { shapeType: 'textBox' } },
+        'c4',
+      ),
+    ]);
+    expect(plan.slice(1).map((node) => node.dependsOn)).toEqual([['e1'], ['e1'], ['e1']]);
+    expect(propagateFailure(plan, 'e1').skipped).toEqual(['e2', 'e3', 'e4']);
+
+    // `/add-table-slide slide=new` creates the last slide, so a later slide=last write depends on it.
+    const table = analyseEffectDependencies([
+      pp(
+        'add-table-slide',
+        { target: { slideId: 'new' }, tableGrid: { hasHeaders: false, rows: [['a']] } },
+        'c1',
+      ),
+      pp('add-shape', { target: { slideId: 'last' }, shape: { shapeType: 'textBox' } }, 'c2'),
+    ]);
+    expect(table[1]!.dependsOn).toEqual(['e1']);
+  });
+
   it('a non-overlapping effect is independent', () => {
     const plan = analyseEffectDependencies([
       req('write-cells', { target: { range: 'Report!A1' }, cells: [['x']] }, 'c1'),

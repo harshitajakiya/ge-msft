@@ -127,6 +127,26 @@ export function effectResources(req: ActuationRequest): {
     case 'post-message':
     case 'post-card':
       return { reads: [], writes: [{ kind: 'draft', id: req.kind }] };
+    case 'insert-slide':
+      // Appends a slide, which becomes the deck's LAST slide: a later `slide=last` write reads it, so
+      // a failed/uncertain insert blocks that write instead of it landing on the user's own last slide.
+      return { reads: [], writes: [{ kind: 'estate', id: req.kind }, obj(LAST_SLIDE)] };
+    case 'add-shape':
+    case 'set-shape-text':
+    case 'format-shape':
+      return {
+        reads: isLastSlideRef(p.target?.slideId) ? [obj(LAST_SLIDE)] : [],
+        writes: [{ kind: 'estate', id: req.kind }],
+      };
+    case 'add-table-slide':
+      // `slide=new` appends a slide (it becomes the last slide, like insert-slide); otherwise it
+      // writes onto an existing slide, depending on a preceding insert when that slide is `last`.
+      return isNewSlideRef(p.target?.slideId)
+        ? { reads: [], writes: [{ kind: 'estate', id: req.kind }, obj(LAST_SLIDE)] }
+        : {
+            reads: isLastSlideRef(p.target?.slideId) ? [obj(LAST_SLIDE)] : [],
+            writes: [{ kind: 'estate', id: req.kind }],
+          };
     default: {
       // Anchored content writes (tracked-change/insert-*/fill-content-control) + estate kinds.
       const anchor = p.target?.matchText ?? p.target?.contentControlId;
@@ -134,6 +154,19 @@ export function effectResources(req: ActuationRequest): {
       return { reads: [], writes: [{ kind: 'estate', id: req.kind }] };
     }
   }
+}
+
+/** The PowerPoint deck's last slide, as a plan resource (see the `insert-slide` case above). */
+const LAST_SLIDE = 'pp:slide:last';
+
+/** A PowerPoint slide reference meaning "the deck's last slide" (resolved by the bridge). */
+function isLastSlideRef(slideId: string | undefined): boolean {
+  return slideId !== undefined && /^(?:pp:)?(?:slide:)?last$/i.test(slideId.trim());
+}
+
+/** `/add-table-slide slide=new`: the bridge creates the slide. */
+function isNewSlideRef(slideId: string | undefined): boolean {
+  return slideId !== undefined && /^(?:pp:)?(?:slide:)?new$/i.test(slideId.trim());
 }
 
 function rangeToA1(r: ParsedRange): string {

@@ -15,7 +15,7 @@ import { buildDocStateSnapshot } from '@ge/content';
 import { POWERPOINT_CAPABILITIES } from './capabilities.js';
 import { isSet } from './capabilities-runtime.js';
 import {
-  parseSlideSelector,
+  mayNameSlide,
   searchSlides,
   selectedShapeToContext,
   selectedSlideToContext,
@@ -23,6 +23,8 @@ import {
   slideContextRef,
   shapesToSlideText,
   slideElementsToDocStateBlocks,
+  slideIndexForSelector,
+  slideShapeListing,
   slidesToContext,
   tableValuesToText,
   type SlideElement,
@@ -189,16 +191,37 @@ export class PowerPointBridge implements DocBridge {
    * it is inherently bounded.
    */
   async readRange(selector: string): Promise<ResolvedContext[]> {
-    const index = parseSlideSelector(selector);
-    if (index === undefined || !isSet('PowerPointApi', '1.4')) return [];
+    if (!mayNameSlide(selector) || !isSet('PowerPointApi', '1.4')) return [];
     return PowerPoint.run(async (ctx) => {
       const slides = ctx.presentation.slides;
       slides.load('items/id,items/index');
       await ctx.sync();
-      const slide = slides.items[index];
+      const index = slideIndexForSelector(
+        slides.items.map((item) => item.id),
+        selector,
+      );
+      const slide = index === undefined ? undefined : slides.items[index];
       if (!slide) return [];
       const element = await readSlide(ctx, slide);
-      return selectedSlideToContext(element);
+      // A single-slide read is how the model looks before a shape command: list each shape's id,
+      // type and which one `shape=title` resolves to, so it can address the shape it means.
+      const shapes = ctx.presentation.slides.getItem(slide.id).shapes;
+      shapes.load('items/id,items/type');
+      await ctx.sync();
+      const title = await findTitleShape(ctx, shapes.items).catch(() => undefined);
+      const types = new Map(shapes.items.map((shape) => [shape.id, shape.type as string]));
+      const listed: SlideElement = {
+        ...element,
+        shapes: (element.shapes ?? []).map((shape) => ({
+          ...shape,
+          ...(types.get(shape.shapeId) ? { type: types.get(shape.shapeId) } : {}),
+          ...(title?.id === shape.shapeId ? { isTitle: true } : {}),
+        })),
+      };
+      return selectedSlideToContext({
+        ...element,
+        body: [...element.body, ...slideShapeListing(listed)],
+      });
     });
   }
 
@@ -272,9 +295,11 @@ export class PowerPointBridge implements DocBridge {
     let mutationQueued = false;
     try {
       return await PowerPoint.run(async (ctx) => {
-        const slide = ctx.presentation.slides.getItem(slideId);
-        const shape = slide.shapes.getItemOrNullObject(shapeId);
-        shape.load('isNullObject');
+        const target = await resolveShapeTarget(ctx, slideId, shapeId);
+        if ('error' in target) return slideNotFound(req, target.error);
+        const slide = ctx.presentation.slides.getItem(target.slideId);
+        const shape = slide.shapes.getItemOrNullObject(target.shapeId);
+        shape.load('isNullObject,type');
         await ctx.sync();
         if (shape.isNullObject) {
           return {
@@ -288,6 +313,13 @@ export class PowerPointBridge implements DocBridge {
             },
           };
         }
+        if (!TEXT_SHAPE_TYPES.has(shape.type)) {
+          return slideNotFound(
+            req,
+            `Shape id ${target.shapeId} is a ${shape.type} and has no text. Use shape=title for the ` +
+              'slide title, or the id of a text box.',
+          );
+        }
         const range = shape.textFrame.textRange;
         range.load('text');
         await ctx.sync();
@@ -299,15 +331,20 @@ export class PowerPointBridge implements DocBridge {
           ok: true,
           changeId: req.changeId,
           kind: req.kind,
-          location: `shape:${slideId}:${shapeId}`,
-          inverse: { op: 'restore-text', anchor: `pp:shape:${slideId}:${shapeId}`, priorText },
+          location: `shape:${target.slideId}:${target.shapeId}`,
+          inverse: {
+            op: 'restore-text',
+            anchor: `pp:shape:${target.slideId}:${target.shapeId}`,
+            priorText,
+          },
         };
       });
-    } catch {
+    } catch (error) {
       if (mutationQueued)
         return unknownActuationResult(
           req,
-          'PowerPoint did not confirm the dispatched change. Inspect the slide before trying again.',
+          `PowerPoint did not confirm the dispatched change${hostErrorSuffix(error)}. ` +
+            'Inspect the slide before trying again.',
         );
       return {
         ok: false,
@@ -332,37 +369,55 @@ export class PowerPointBridge implements DocBridge {
         error: { code: 'empty_slide', message: 'insert-slide needs params.slide or params.ooxml' },
       };
     }
-    return PowerPoint.run(async (ctx) => {
-      // Prebuilt deck path: the agent supplied a Base64 PPTX — let the host merge it (1.2).
-      if (plan.base64) {
+    if (plan.base64) {
+      const base64 = plan.base64;
+      return PowerPoint.run(async (ctx) => {
+        // Prebuilt deck path: the agent supplied a Base64 PPTX — let the host merge it (1.2).
         const options = await deckInsertOptions(ctx, plan);
-        ctx.presentation.insertSlidesFromBase64(plan.base64, options);
+        ctx.presentation.insertSlidesFromBase64(base64, options);
         await ctx.sync();
         const location =
           plan.slideCount === undefined ? 'inserted-deck' : `inserted-deck:${plan.slideCount}`;
         return { ok: true, changeId: req.changeId, kind: req.kind, location };
+      });
+    }
+
+    // Native compose path: append a slide, then write the title/bullets into it.
+    //
+    // PowerPoint for the web gives a just-added slide a PROVISIONAL id: writes addressed through
+    // that id — `getItem(id)` (5010 "InvalidParam passed to GetItem(id)") or the slide object from
+    // the `items` list (GeneralException) — are rejected, while writes by position (`getItemAt`)
+    // work; the slide gets its real id once the request completes. So: find the new slide's
+    // POSITION by the one id that is new (never a stale index — a co-author's concurrent add must
+    // not redirect the text), write to it by position, and read its real id back afterwards.
+    let newIndex: number | undefined;
+    const result = await PowerPoint.run(async (ctx): Promise<ActuationResult> => {
+      try {
+        const added = await appendSlide(ctx);
+        if ('error' in added) return unknownActuationResult(req, added.error);
+        const { index, provisionalId, shapes } = added;
+        await writeComposedSlide(ctx, index, shapes, plan.title, plan.bullets);
+        await ctx.sync();
+        newIndex = index;
+        return {
+          ok: true,
+          changeId: req.changeId,
+          kind: req.kind,
+          location: `slide:${provisionalId}`,
+        };
+      } catch (error) {
+        // The slide may already be in the deck; never report an unconfirmed write as success.
+        return unknownActuationResult(
+          req,
+          `PowerPoint did not confirm the new slide and its text${hostErrorSuffix(error)}. ` +
+            'Inspect the deck before trying again.',
+        );
       }
-      // Native compose path: append a slide, then fill its placeholder shapes with title/body.
-      const slides = ctx.presentation.slides;
-      const before = slides.getCount();
-      await ctx.sync();
-      slides.add();
-      await ctx.sync();
-      // Re-read the appended slide (last index) and write its shapes' text.
-      const slide = slides.getItemAt(before.value);
-      const shapes = slide.shapes;
-      shapes.load('items/id');
-      slide.load('id');
-      await ctx.sync();
-      writeSlideText(shapes, plan.title, plan.bullets);
-      await ctx.sync();
-      return {
-        ok: true,
-        changeId: req.changeId,
-        kind: req.kind,
-        location: `slide:${slide.id}`,
-      };
     });
+    if (!result.ok || newIndex === undefined) return result;
+    // Best effort: report the slide's settled id (the one `outline` and later commands will see).
+    const settledId = await readSlideIdAt(newIndex);
+    return settledId ? { ...result, location: `slide:${settledId}` } : result;
   }
 
   private async applyAddShape(req: ActuationRequest): Promise<ActuationResult> {
@@ -387,7 +442,14 @@ export class PowerPointBridge implements DocBridge {
     try {
       return await PowerPoint.run(async (ctx) => {
         const op = resolution.op;
-        const slide = ctx.presentation.slides.getItem(op.slideId);
+        const target = await resolveSlideRef(ctx, op.slideId);
+        if ('error' in target) return slideNotFound(req, target.error);
+        const size = await knownSlideSize(ctx);
+        const unplaced = missingGeometryMessage(size, op);
+        if (unplaced) return slideNotFound(req, unplaced);
+        const offSlide = offSlideMessage(size, op);
+        if (offSlide) return slideNotFound(req, offSlide);
+        const slide = ctx.presentation.slides.getItem(target.slideId);
         const options: PowerPoint.ShapeAddOptions = {};
         if (op.left !== undefined) options.left = op.left;
         if (op.top !== undefined) options.top = op.top;
@@ -408,15 +470,16 @@ export class PowerPointBridge implements DocBridge {
           ok: true,
           changeId: req.changeId,
           kind: req.kind,
-          location: `shape:${op.slideId}:${mintedId}`,
+          location: `shape:${target.slideId}:${mintedId}`,
           inverse: { op: 'delete-object', objectType: 'shape', name: mintedId },
         };
       });
-    } catch {
+    } catch (error) {
       if (mutationQueued)
         return unknownActuationResult(
           req,
-          'PowerPoint did not confirm the dispatched change. Inspect the slide before trying again.',
+          `PowerPoint did not confirm the dispatched change${hostErrorSuffix(error)}. ` +
+            'Inspect the slide before trying again.',
         );
       return {
         ok: false,
@@ -446,12 +509,19 @@ export class PowerPointBridge implements DocBridge {
         },
       };
     }
-    if (!format) {
+    if (!format || Object.keys(format).length === 0) {
+      // An empty format would "apply" nothing and still report success.
       return {
         ok: false,
         changeId: req.changeId,
         kind: req.kind,
-        error: { code: 'no_format', message: 'format-shape needs params.shapeFormat' },
+        error: {
+          code: 'no_format',
+          message:
+            'format-shape needs at least one of fill=, line=, fontColor=, fontSize=, fontBold=, ' +
+            "fontItalic=, fontName= or zOrder=. To change a shape's text use: shape " +
+            'pp:shape:<slide>:<shape> "text".',
+        },
       };
     }
     if (!isSet('PowerPointApi', '1.4')) {
@@ -477,8 +547,10 @@ export class PowerPointBridge implements DocBridge {
     let mutationQueued = false;
     try {
       return await PowerPoint.run(async (ctx) => {
-        const slide = ctx.presentation.slides.getItem(slideId);
-        const shape = slide.shapes.getItemOrNullObject(shapeId);
+        const target = await resolveShapeTarget(ctx, slideId, shapeId);
+        if ('error' in target) return slideNotFound(req, target.error);
+        const slide = ctx.presentation.slides.getItem(target.slideId);
+        const shape = slide.shapes.getItemOrNullObject(target.shapeId);
         shape.load('isNullObject');
         await ctx.sync();
         if (shape.isNullObject) {
@@ -557,15 +629,16 @@ export class PowerPointBridge implements DocBridge {
           ok: true,
           changeId: req.changeId,
           kind: req.kind,
-          location: `shape:${slideId}:${shapeId}`,
-          inverse: { op: 'restore-shape-format', shapeId, prior },
+          location: `shape:${target.slideId}:${target.shapeId}`,
+          inverse: { op: 'restore-shape-format', shapeId: target.shapeId, prior },
         };
       });
-    } catch {
+    } catch (error) {
       if (mutationQueued)
         return unknownActuationResult(
           req,
-          'PowerPoint did not confirm the dispatched change. Inspect the slide before trying again.',
+          `PowerPoint did not confirm the dispatched change${hostErrorSuffix(error)}. ` +
+            'Inspect the slide before trying again.',
         );
       return {
         ok: false,
@@ -588,7 +661,12 @@ export class PowerPointBridge implements DocBridge {
         ok: false,
         changeId: req.changeId,
         kind: req.kind,
-        error: { code: 'no_target', message: 'add-table-slide needs target.slideId' },
+        error: {
+          code: 'no_target',
+          message:
+            'add-table-slide needs a slide: slide=new title="…" creates a slide for the table; ' +
+            `or add it to an existing slide. ${SLIDE_TARGET_HINT}`,
+        },
       };
     }
     const columnCount = grid?.rows.reduce((max, row) => Math.max(max, row.length), 0) ?? 0;
@@ -610,16 +688,62 @@ export class PowerPointBridge implements DocBridge {
     }
 
     let mutationQueued = false;
+    let newSlideIndex: number | undefined;
     try {
-      return await PowerPoint.run(async (ctx) => {
-        const slide = ctx.presentation.slides.getItem(slideId);
+      const result = await PowerPoint.run(async (ctx): Promise<ActuationResult> => {
+        const offSlide = offSlideMessage(await knownSlideSize(ctx), grid);
+        if (offSlide) return slideNotFound(req, offSlide);
+        let shapes: PowerPoint.ShapeCollection;
+        let slideLocation: string;
+        /** Where a table goes when the command gave no position: below a title this command wrote. */
+        let belowTitle: { left: number; top: number; width: number } | undefined;
+        if (/^new$/i.test(slideId.trim())) {
+          // `slide=new`: this command's name promises a slide, so create one for the table. Write
+          // through a fresh position proxy (see appendSlide — PowerPoint web rejects writes addressed
+          // by a just-added slide's provisional id), and report the settled id afterwards.
+          mutationQueued = true;
+          const added = await appendSlide(ctx);
+          if ('error' in added) return unknownActuationResult(req, added.error);
+          newSlideIndex = added.index;
+          slideLocation = added.provisionalId;
+          const title = req.params.slide?.title?.trim();
+          // The title goes into the layout's title placeholder when there is one, else a text box
+          // (same rules as insert-slide).
+          if (title) {
+            await writeComposedSlide(ctx, added.index, added.shapes, title, []);
+            // Without this the host drops the table near the top, over the title (seen live).
+            const size = await slideSize(ctx);
+            const margin = Math.round(size.width * 0.067);
+            belowTitle = {
+              left: margin,
+              top: Math.round(size.height * 0.27),
+              width: size.width - margin * 2,
+            };
+          }
+          shapes = ctx.presentation.slides.getItemAt(added.index).shapes;
+        } else {
+          if (req.params.slide?.title?.trim()) {
+            return slideNotFound(
+              req,
+              'title= is only used with slide=new (it names the slide that command creates). To ' +
+                'retitle an existing slide use: shape pp:shape:<slide>:title "New title".',
+            );
+          }
+          const target = await resolveSlideRef(ctx, slideId);
+          if ('error' in target) return slideNotFound(req, target.error);
+          slideLocation = target.slideId;
+          shapes = ctx.presentation.slides.getItem(target.slideId).shapes;
+        }
         const options: PowerPoint.TableAddOptions = {};
         if (grid.left !== undefined) options.left = grid.left;
+        else if (belowTitle) options.left = belowTitle.left;
         if (grid.top !== undefined) options.top = grid.top;
+        else if (belowTitle) options.top = belowTitle.top;
         if (grid.width !== undefined) options.width = grid.width;
+        else if (belowTitle) options.width = belowTitle.width;
         if (grid.height !== undefined) options.height = grid.height;
         mutationQueued = true;
-        const added = slide.shapes.addTable(grid.rows.length, columnCount, options);
+        const added = shapes.addTable(grid.rows.length, columnCount, options);
         const table = added.getTable();
         grid.rows.forEach((row, r) => {
           row.forEach((value, c) => {
@@ -633,15 +757,25 @@ export class PowerPointBridge implements DocBridge {
           ok: true,
           changeId: req.changeId,
           kind: req.kind,
-          location: `shape:${slideId}:${mintedId}`,
+          location: `shape:${slideLocation}:${mintedId}`,
           inverse: { op: 'delete-object', objectType: 'shape', name: mintedId },
         };
       });
-    } catch {
+      if (!result.ok || newSlideIndex === undefined) return result;
+      const settledId = await readSlideIdAt(newSlideIndex);
+      if (!settledId) return result;
+      // The command created the slide: undoing it means deleting the slide (and the table with it).
+      return {
+        ...result,
+        location: result.location?.replace(/^shape:[^:]+(?=:)/, `shape:${settledId}`),
+        inverse: { op: 'delete-object', objectType: 'slide', name: settledId },
+      };
+    } catch (error) {
       if (mutationQueued)
         return unknownActuationResult(
           req,
-          'PowerPoint did not confirm the dispatched change. Inspect the slide before trying again.',
+          `PowerPoint did not confirm the dispatched change${hostErrorSuffix(error)}. ` +
+            'Inspect the slide before trying again.',
         );
       return {
         ok: false,
@@ -780,7 +914,7 @@ type AddShapeResolution =
   | { ok: true; op: AddShapeOp }
   | {
       ok: false;
-      code: 'no_target' | 'no_shape' | 'unsupported';
+      code: 'no_target' | 'no_shape' | 'no_text' | 'unsupported';
       message: string;
     };
 
@@ -791,7 +925,11 @@ type AddShapeResolution =
 function resolveAddShape(req: ActuationRequest): AddShapeResolution {
   const slideId = req.params.target?.slideId;
   if (!slideId) {
-    return { ok: false, code: 'no_target', message: 'add-shape needs target.slideId' };
+    return {
+      ok: false,
+      code: 'no_target',
+      message: `add-shape needs target.slideId. ${SLIDE_TARGET_HINT}`,
+    };
   }
   const shape = req.params.shape;
   if (!shape) {
@@ -806,6 +944,18 @@ function resolveAddShape(req: ActuationRequest): AddShapeResolution {
     height: shape.height,
   };
   if (shape.shapeType === 'textBox') {
+    const text = shape.text?.trim() ?? '';
+    if (!text) {
+      // Live: a malformed `/add-shape slide:2 {"text": …}` arrived with no text and was "applied"
+      // as an empty box in the corner.
+      return {
+        ok: false,
+        code: 'no_text',
+        message:
+          'add-shape shapeType=textBox needs text="…". Example: /add-shape slide=2 shapeType=textBox ' +
+          'text="Draft" left=72 top=330 width=400 height=40',
+      };
+    }
     return { ok: true, op: { ...base, type: 'textBox', text: shape.text ?? '' } };
   }
   if (shape.shapeType === 'line') {
@@ -1070,22 +1220,348 @@ async function readShapeContext(
   );
 }
 
+/** Placeholder types that take a slide title / its body text, in preference order. */
+const TITLE_PLACEHOLDERS: readonly string[] = ['Title', 'CenterTitle', 'VerticalTitle'];
+const BODY_PLACEHOLDERS: readonly string[] = ['Body', 'Content', 'Subtitle', 'VerticalBody'];
+
 /**
- * Write a composed title + bullets into a freshly added slide. The first shape (the title
- * placeholder, by layout convention) takes the title; the next gets the bullets joined by
- * newlines. Shapes are addressed by their loaded items; missing placeholders are skipped.
+ * Slide size used for fallback text boxes when the host can't report it (`pageSetup` is
+ * PowerPointApi 1.10). 720 × 405 pt is the smallest standard slide (10" × 5.625"), so boxes laid
+ * out for it stay on-slide on 16:9 widescreen (960 × 540) and 4:3 (720 × 540) decks too.
  */
-function writeSlideText(
-  shapes: PowerPoint.ShapeCollection,
+const FALLBACK_SLIDE_SIZE = { width: 720, height: 405 };
+
+/**
+ * Write a composed title + bullets into a freshly added slide.
+ *
+ * `slides.add()` uses the deck's default layout, and a layout may have no title/body placeholders at
+ * all (a "Blank" layout, or decks generated by tools such as pptxgenjs). So: write into the title and
+ * body placeholders when the slide has them (matched by placeholder type on PowerPointApi 1.8, else
+ * the first two placeholders in order); for any part with no placeholder, add a sized text box.
+ * Every requested part is written somewhere — never a silent no-op.
+ *
+ * `shapes` (from a loaded probe) is only READ, for types and positions. Every WRITE goes through a
+ * fresh, never-loaded `slides.getItemAt(slideIndex)` (and `shapes.getItemAt(i)`) proxy: PowerPoint
+ * for the web rejects writes addressed through a just-added slide's provisional id (5010
+ * "InvalidParam passed to GetItem(id)"), and a loaded proxy is addressed by id.
+ */
+async function writeComposedSlide(
+  ctx: PowerPoint.RequestContext,
+  slideIndex: number,
+  shapes: PowerPoint.Shape[],
   title: string,
   bullets: string[],
-): void {
-  const titleShape = shapes.items[0];
-  if (titleShape && title) titleShape.textFrame.textRange.text = title;
-  const bodyShape = shapes.items[1];
-  if (bodyShape && bullets.length > 0) {
-    bodyShape.textFrame.textRange.text = bullets.join('\n');
+): Promise<void> {
+  const { titleShape, bodyShape } = await findTextPlaceholders(ctx, shapes);
+  const needsBox = (title && !titleShape) || (bullets.length > 0 && !bodyShape);
+  const size = needsBox ? await slideSize(ctx) : FALLBACK_SLIDE_SIZE;
+  const margin = Math.round(size.width * 0.067);
+  const width = size.width - margin * 2;
+  const freshShapes = (): PowerPoint.ShapeCollection =>
+    ctx.presentation.slides.getItemAt(slideIndex).shapes;
+  const writeInto = (shape: PowerPoint.Shape, text: string): void => {
+    freshShapes().getItemAt(shapes.indexOf(shape)).textFrame.textRange.text = text;
+  };
+
+  if (title) {
+    if (titleShape) {
+      writeInto(titleShape, title);
+    } else {
+      const box = freshShapes().addTextBox(title, {
+        left: margin,
+        top: Math.round(size.height * 0.07),
+        width,
+        height: Math.round(size.height * 0.18),
+      });
+      box.textFrame.textRange.font.size = 32;
+      box.textFrame.textRange.font.bold = true;
+    }
   }
+  if (bullets.length > 0) {
+    if (bodyShape) {
+      // A body placeholder brings the layout's own bullet style.
+      writeInto(bodyShape, bullets.join('\n'));
+    } else {
+      const box = freshShapes().addTextBox(bullets.map((bullet) => `• ${bullet}`).join('\n'), {
+        left: margin,
+        top: Math.round(size.height * 0.28),
+        width,
+        height: Math.round(size.height * 0.62),
+      });
+      box.textFrame.textRange.font.size = 18;
+    }
+  }
+}
+
+/** The new slide's title and body placeholders, if its layout has them. */
+async function findTextPlaceholders(
+  ctx: PowerPoint.RequestContext,
+  shapes: PowerPoint.Shape[],
+): Promise<{ titleShape?: PowerPoint.Shape; bodyShape?: PowerPoint.Shape }> {
+  const placeholders = shapes.filter((shape) => shape.type === 'Placeholder');
+  if (placeholders.length === 0) return {};
+  if (!isSet('PowerPointApi', '1.8')) {
+    // No placeholder types to match on: title first, body second (the layout convention).
+    return { titleShape: placeholders[0], bodyShape: placeholders[1] };
+  }
+  const formats = placeholders.map((shape) => {
+    const format = shape.placeholderFormat;
+    format.load('type');
+    return [shape, format] as const;
+  });
+  await ctx.sync();
+  const firstOf = (types: readonly string[]): PowerPoint.Shape | undefined => {
+    for (const type of types) {
+      const hit = formats.find(([, format]) => format.type === type);
+      if (hit) return hit[0];
+    }
+    return undefined;
+  };
+  const titleShape = firstOf(TITLE_PLACEHOLDERS);
+  const bodyShape = firstOf(BODY_PLACEHOLDERS);
+  return { ...(titleShape ? { titleShape } : {}), ...(bodyShape ? { bodyShape } : {}) };
+}
+
+/** The deck's slide size in points, or {@link FALLBACK_SLIDE_SIZE} if the host can't report it. */
+async function slideSize(
+  ctx: PowerPoint.RequestContext,
+): Promise<{ width: number; height: number }> {
+  if (!isSet('PowerPointApi', '1.10')) return FALLBACK_SLIDE_SIZE;
+  try {
+    const setup = ctx.presentation.pageSetup;
+    setup.load('slideWidth,slideHeight');
+    await ctx.sync();
+    if (setup.slideWidth > 0 && setup.slideHeight > 0) {
+      return { width: setup.slideWidth, height: setup.slideHeight };
+    }
+  } catch {
+    // Fall through to the size that fits every standard slide.
+  }
+  return FALLBACK_SLIDE_SIZE;
+}
+
+/**
+ * Resolve the slide a write command names. Commands come from the model, which may give an exact
+ * host id (`256#0` on PowerPoint web), `slide:<id>` / `pp:slide:<id>`, a 1-based slide number, or `last` for the
+ * deck's last slide (e.g. the one a preceding `insert-slide` just added — the planner makes a
+ * `slide=last` write depend on that insert, so it never runs if the insert failed). Resolved with one
+ * read-only sync BEFORE any mutation is queued, so a bad reference fails cleanly with the valid
+ * choices instead of surfacing as an "outcome uncertain" write.
+ */
+async function resolveSlideRef(
+  ctx: PowerPoint.RequestContext,
+  raw: string,
+): Promise<{ slideId: string } | { error: string }> {
+  const slides = ctx.presentation.slides;
+  slides.load('items/id');
+  await ctx.sync();
+  const ids = slides.items.map((slide) => slide.id);
+  const key = raw.trim().replace(/^(?:pp:)?slide:/i, '');
+  if (/^last$/i.test(key)) {
+    const last = ids.at(-1);
+    return last ? { slideId: last } : { error: 'The deck has no slides yet.' };
+  }
+  if (ids.includes(key)) return { slideId: key };
+  if (/^\d+$/.test(key)) {
+    const id = ids[Number(key) - 1];
+    if (id) return { slideId: id };
+  }
+  const shown = ids.slice(0, 12).join(', ') + (ids.length > 12 ? ', …' : '');
+  return {
+    error:
+      `Slide ${JSON.stringify(raw.slice(0, 64))} was not found. Use a slide id from the outline (${shown}), ` +
+      `a slide number 1–${ids.length}, or "last". To create a new slide with a title and bullets, ` +
+      'use the slide command: slide "Title" "bullet" "bullet".',
+  };
+}
+
+/**
+ * Appended to a missing-slide error so the model can recover in one turn: models reach for the
+ * `/add-*` commands to CREATE a slide with text; `slide "Title" "bullet"` is the command for that.
+ */
+const SLIDE_TARGET_HINT =
+  'Pass slide= a slide id from the outline, a slide number, or last. To create a new slide with a title and ' +
+  'bullets, use the slide command instead: slide "Title" "bullet" "bullet".';
+
+/**
+ * Append a slide and identify it. Finds the new slide's POSITION by the one id that is new (never a
+ * pre-computed index — a co-author's concurrent add must not redirect later writes), then reads its
+ * shapes through a probe proxy. The caller must WRITE through fresh, never-loaded
+ * `slides.getItemAt(index)` proxies: PowerPoint for the web gives a just-added slide a provisional
+ * id that rejects writes (5010 "InvalidParam passed to GetItem(id)"), and loading a proxy
+ * re-addresses it by id. Queues the add — callers treat any failure after this as outcome-unknown.
+ */
+async function appendSlide(
+  ctx: PowerPoint.RequestContext,
+): Promise<
+  { index: number; provisionalId: string; shapes: PowerPoint.Shape[] } | { error: string }
+> {
+  const slides = ctx.presentation.slides;
+  slides.load('items/id');
+  await ctx.sync();
+  const existingIds = new Set(slides.items.map((item) => item.id));
+  slides.add();
+  await ctx.sync();
+  const after = ctx.presentation.slides;
+  after.load('items/id');
+  await ctx.sync();
+  const newIndexes = after.items.flatMap((item, index) =>
+    existingIds.has(item.id) ? [] : [index],
+  );
+  const index = newIndexes.length === 1 ? newIndexes[0] : undefined;
+  const provisionalId = index === undefined ? undefined : after.items[index]?.id;
+  if (index === undefined || provisionalId === undefined) {
+    return {
+      error:
+        'PowerPoint added a slide but it could not be identified. Inspect the deck before trying again.',
+    };
+  }
+  const probe = ctx.presentation.slides.getItemAt(index);
+  probe.load('id');
+  const shapes = probe.shapes;
+  shapes.load('items/id,items/type');
+  await ctx.sync();
+  if (probe.id !== provisionalId) {
+    return {
+      error:
+        'The deck changed while the slide was being added. Inspect the deck before trying again.',
+    };
+  }
+  return { index, provisionalId, shapes: shapes.items };
+}
+
+/**
+ * Resolve the slide + shape a shape command names. Slides as in {@link resolveSlideRef}; shapes by
+ * exact host id or `title` (the Title/CenterTitle placeholder, else the first shape with text).
+ * Deliberately no shape ordinals (see below). Read-only, before any mutation; an unknown reference
+ * returns the valid choices.
+ */
+async function resolveShapeTarget(
+  ctx: PowerPoint.RequestContext,
+  slideRef: string,
+  shapeRef: string,
+): Promise<{ slideId: string; shapeId: string } | { error: string }> {
+  const slide = await resolveSlideRef(ctx, slideRef);
+  if ('error' in slide) return slide;
+  const collection = ctx.presentation.slides.getItem(slide.slideId).shapes;
+  collection.load('items/id,items/type');
+  await ctx.sync();
+  const shapes = collection.items;
+  const key = shapeRef.trim().replace(/^(?:pp:)?shape:/i, '');
+  const exact = shapes.find((shape) => shape.id === key);
+  if (exact) return { slideId: slide.slideId, shapeId: exact.id };
+  if (/^title$/i.test(key)) {
+    const title = await findTitleShape(ctx, shapes);
+    if (title) return { slideId: slide.slideId, shapeId: title.id };
+  }
+  // No shape ordinals: PowerPoint shape ids are small numbers themselves (2, 3, 4…), so "2" would be
+  // ambiguous between "id 2" and "the 2nd shape". Only exact ids and `title` resolve.
+  const shown = shapes
+    .slice(0, 12)
+    .map((shape) => `id ${shape.id} (${shape.type})`)
+    .join(', ');
+  return {
+    error:
+      `Shape ${JSON.stringify(key.slice(0, 64))} was not found on that slide. Use shape=title for ` +
+      `the slide title, or one of its shape ids: ${shown || 'the slide has no shapes'}.`,
+  };
+}
+
+/** A slide's title shape: its Title/CenterTitle placeholder, else the first shape with text. */
+async function findTitleShape(
+  ctx: PowerPoint.RequestContext,
+  shapes: PowerPoint.Shape[],
+): Promise<PowerPoint.Shape | undefined> {
+  const { titleShape } = await findTextPlaceholders(ctx, shapes);
+  if (titleShape && isSet('PowerPointApi', '1.8')) return titleShape;
+  const readable = await withoutNonTextPlaceholders(ctx, shapes.filter(isReadableShape));
+  const texts = await readShapeContent(ctx, readable);
+  return readable.find((shape) => shape.type !== 'Table' && (texts.get(shape) ?? '').trim());
+}
+
+/** The deck's slide size when the host reports it (PowerPointApi 1.10), else undefined. */
+async function knownSlideSize(
+  ctx: PowerPoint.RequestContext,
+): Promise<{ width: number; height: number } | undefined> {
+  if (!isSet('PowerPointApi', '1.10')) return undefined;
+  const size = await slideSize(ctx);
+  return size === FALLBACK_SLIDE_SIZE ? undefined : size;
+}
+
+/**
+ * `add-shape` needs explicit placement (the capability's contract: "never infer placement from
+ * prose"). Without it the host drops the shape at the top-left corner — so "near the bottom" came
+ * out at the top. The message gives the slide size so the next turn can place it.
+ */
+function missingGeometryMessage(
+  size: { width: number; height: number } | undefined,
+  geometry: { left?: number; top?: number; width?: number; height?: number },
+): string | undefined {
+  const missing = (['left', 'top', 'width', 'height'] as const).filter(
+    (k) => geometry[k] === undefined,
+  );
+  if (missing.length === 0) return undefined;
+  const slide = size
+    ? `The slide is ${size.width} × ${size.height} pt (the bottom edge is top=${size.height}). `
+    : '';
+  return (
+    `add-shape needs an explicit position: missing ${missing.join(', ')}. ${slide}` +
+    'Give left= top= width= height= in points, e.g. near the bottom: ' +
+    (size
+      ? `left=${Math.round(size.width * 0.1)} top=${Math.round(size.height * 0.82)} width=${Math.round(size.width * 0.6)} height=${Math.round(size.height * 0.1)}.`
+      : 'left=72 top=330 width=400 height=40.')
+  );
+}
+
+/**
+ * A corrective message when explicit geometry would place the shape outside the slide (models
+ * guess a 960 × 540 slide on a 720 × 405 deck), so the next turn can fix it; undefined when it fits
+ * or the size is unknown.
+ */
+function offSlideMessage(
+  size: { width: number; height: number } | undefined,
+  geometry: { left?: number; top?: number; width?: number; height?: number },
+): string | undefined {
+  if (!size) return undefined;
+  const { left = 0, top = 0, width = 0, height = 0 } = geometry;
+  if (left >= 0 && top >= 0 && left + width <= size.width && top + height <= size.height) {
+    return undefined;
+  }
+  return (
+    `That position is outside the slide, which is ${size.width} × ${size.height} pt: keep ` +
+    `left + width ≤ ${size.width} and top + height ≤ ${size.height} ` +
+    `(got left ${left}, top ${top}, width ${width}, height ${height}).`
+  );
+}
+
+/** `" (PowerPoint: <code>)"` for an Office.js error, so an "uncertain" result says why. */
+function hostErrorSuffix(error: unknown): string {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && /^[\w.-]{1,64}$/.test(code) ? ` (PowerPoint: ${code})` : '';
+}
+
+/** The id of the slide at `index`, read in a fresh request (undefined if it can't be read). */
+async function readSlideIdAt(index: number): Promise<string | undefined> {
+  try {
+    return await PowerPoint.run(async (ctx) => {
+      const slide = ctx.presentation.slides.getItemAt(index);
+      slide.load('id');
+      await ctx.sync();
+      return slide.id;
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function slideNotFound(req: ActuationRequest, message: string): ActuationResult {
+  return {
+    ok: false,
+    changeId: req.changeId,
+    kind: req.kind,
+    degraded: true,
+    error: { code: 'target_conflict', message },
+  };
 }
 
 /** Actual dispatch keys; conformance checks these against the advertised capabilities. */

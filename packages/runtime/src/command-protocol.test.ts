@@ -8,7 +8,7 @@ import type {
   ResolvedContext,
   SseEvent,
 } from '@ge/contracts';
-import { ActuationRequestSchema } from '@ge/contracts';
+import { ActuationRequestSchema, parseCommandLine } from '@ge/contracts';
 import type { StreamAssistClient, StreamOptions } from '@ge/gemini-client';
 import type { AssistRequest } from '@ge/contracts';
 import { TriggerRegistry } from '@ge/triggers';
@@ -700,6 +700,62 @@ describe('compileCommand', () => {
       },
     });
     if ('request' in c) expect(() => ActuationRequestSchema.parse(c.request)).not.toThrow();
+  });
+
+  it('reads the PowerPoint slide / shape references models actually write', () => {
+    const compile = (line: string) => {
+      const parsed = parseCommandLine(line);
+      if ('error' in parsed) throw new Error(parsed.error);
+      const c = compileCommand(parsed, { surface: 'powerpoint', mintChangeId: mint });
+      if (!('request' in c)) throw new Error(JSON.stringify(c));
+      expect(() => ActuationRequestSchema.parse(c.request)).not.toThrow();
+      return c.request.params;
+    };
+    // A bare slide reference as the first argument (live: `/add-shape pp:slide:264#0 …`).
+    expect(
+      compile('/add-shape pp:slide:257#0 shapeType=textBox text="Draft" left=72 top=300').target,
+    ).toEqual({ slideId: 'pp:slide:257#0' });
+    expect(compile('/add-shape 2 shapeType=textBox text="Draft"').target).toEqual({ slideId: '2' });
+    // A quoted title is never mistaken for a slide.
+    expect(compile('/add-table-slide "Key Risks" rows="Risk\\tOwner"').target).toBeUndefined();
+    // Live: `/add-table-slide "Risks and Mitigations" "Risk | Owner" "Vendor delay | Pat"` →
+    // a new titled slide with that table.
+    const quoted = compile(
+      '/add-table-slide "Key risks" "Risk | Owner" "Vendor delay | Pat" "Budget | Sam"',
+    );
+    expect(quoted.target).toEqual({ slideId: 'new' });
+    expect(quoted.slide).toEqual({ title: 'Key risks', bullets: [] });
+    expect(quoted.tableGrid?.rows).toEqual([
+      ['Risk', 'Owner'],
+      ['Vendor delay', 'Pat'],
+      ['Budget', 'Sam'],
+    ]);
+    // A flat list of single cells is not guessed into columns.
+    expect(compile('/add-table-slide "Key risks" "Risk" "Owner" "Vendor"').tableGrid?.rows).toEqual(
+      [],
+    );
+    // `slide=new title=…` carries the new slide's title.
+    const table = compile('/add-table-slide slide=new title="Key risks" rows="Risk\\tOwner"');
+    expect(table.target).toEqual({ slideId: 'new' });
+    expect(table.slide).toEqual({ title: 'Key risks', bullets: [] });
+    // `slide=1 shape=title` + dotted style keys (live: `fill.color=#0000FF font.color=#FFFFFF`).
+    const format = compile(
+      '/format-shape slide=1 shape=title fill.color=#0000FF font.color="#FFFFFF" font.size=28',
+    );
+    expect(format.target).toEqual({ slideId: '1', shapeId: 'title' });
+    expect(format.shapeFormat).toEqual({ fill: '#0000FF', font: { color: '#FFFFFF', size: 28 } });
+    // Live: `/format-shape pp:shape:1:title fill=#0000FF color=#FFFFFF` left the text black.
+    expect(
+      compile('/format-shape pp:shape:1:title fill=#0000FF color=#FFFFFF').shapeFormat,
+    ).toEqual({
+      fill: '#0000FF',
+      font: { color: '#FFFFFF' },
+    });
+    expect(compile('/format-shape slide=1 shape=s1-shape-1 fillColor=#123456').shapeFormat).toEqual(
+      {
+        fill: '#123456',
+      },
+    );
   });
 
   it('compiles specialized /format-shape into typed PowerPoint shape formatting params', () => {

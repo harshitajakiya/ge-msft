@@ -48,6 +48,49 @@ describe('compact capability disclosure', () => {
     },
   );
 
+  it('steers "add a slide" to the slide command, and "add a table to a slide" to /add-table-slide', () => {
+    const deck = manifest('powerpoint');
+    const task =
+      "Add a slide titled 'Q4 plan' with the points: hire 5 engineers, ship firmware 4.2";
+    // The core create verb's exact signature is always listed on PowerPoint…
+    const bootstrap = renderCommandBootstrap(deck, task);
+    const signatures =
+      bootstrap.split('Common exact signatures:')[1]?.split('help <verb>')[0] ?? '';
+    expect(signatures).toMatch(/^slide "Title" "bullet" \.\.\./m);
+    // …and it outranks the specialized command that merely shares the words "add" and "slide".
+    const cards = discoverCommands(deck, task);
+    expect(cards[0]?.command).toBe('slide');
+    expect(cards[0]?.example).toBe('slide "Q4 plan" "Hire 5 engineers" "Ship firmware 4.2"');
+    expect(bootstrap).toContain('Relevant command:\nCommand: slide');
+    // A task that names the whole specialized command still gets it first.
+    expect(discoverCommands(deck, 'add a table to slide 3')[0]?.command).toBe('/add-table-slide');
+  });
+
+  it('surfaces the shape commands for "… on slide N" requests (tests 48–50)', () => {
+    const deck = manifest('powerpoint');
+    const top2 = (task: string) =>
+      discoverCommands(deck, task)
+        .slice(0, 2)
+        .map((c) => c.command);
+    // "slide 1" is a location, not a request for the slide command; colour names mean colour.
+    expect(top2('Make the title shape on slide 1 blue with white text')).toContain('/format-shape');
+    expect(top2("Change the title on slide 1 to 'FY26 Plan'")).toContain('shape');
+    expect(top2("Add a text box on slide 2 near the bottom saying 'Draft'")).toContain(
+      '/add-shape',
+    );
+    // Unchanged: creating slides still surfaces the slide commands.
+    expect(top2('Add a slide with a table of 3 risks and their owners')[0]).toBe(
+      '/add-table-slide',
+    );
+    expect(top2("Add a slide titled 'Q4 plan' with two points")[0]).toBe('slide');
+  });
+
+  it('lists the slide signature only on PowerPoint', () => {
+    for (const surface of ['excel', 'word', 'outlook', 'onenote', 'teams'] as const) {
+      expect(renderCommandBootstrap(manifest(surface))).not.toContain('slide "Title"');
+    }
+  });
+
   it('keeps capability order stable across manifest ordering and does not copy task text', () => {
     const current = manifest('excel');
     const reversed = { ...current, actuations: [...current.actuations].reverse() };

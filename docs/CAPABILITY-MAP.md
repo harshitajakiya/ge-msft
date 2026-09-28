@@ -85,14 +85,17 @@ when its bridge method exists — conformance-enforced per surface (`capability-
 | **format-conditional** | Excel | ✅ `bridge-excel` conditional-format rules |
 | **comment-reply** (+ resolve) | Word, Excel | ✅ |
 | **fill-content-control** | Word | ✅ `bridge-word` direct fill of a known content-control id; prior value captured as inverse |
-| **insert-slide** | PowerPoint | ✅ `bridge-powerpoint` (native compose or client-staged base64 PPTX deck import) |
-| **set-shape-text** | PowerPoint | ✅ `bridge-powerpoint` exact slide+shape text replacement |
+| **insert-slide** | PowerPoint | ✅ `bridge-powerpoint` native compose: title/bullets into the layout's placeholders, else sized text boxes; written by position (PowerPoint web rejects writes through a new slide's provisional id) — see [POWERPOINT-INSERT-SLIDE.md](POWERPOINT-INSERT-SLIDE.md). The base64 PPTX deck import path exists in the bridge, but no app flow stages a compiled deck yet |
+| **set-shape-text** | PowerPoint | ✅ `bridge-powerpoint` text of one shape, addressed `pp:shape:<slide>:<shape>` (slide = id, number or `last`; shape = id or `title`) — see [POWERPOINT-SHAPE-COMMANDS.md](POWERPOINT-SHAPE-COMMANDS.md) |
+| **add-shape** | PowerPoint | ✅ `bridge-powerpoint` text box / geometric shape / line on an addressed slide; off-slide geometry rejected with the slide size |
+| **format-shape** | PowerPoint | ✅ `bridge-powerpoint` fill, line, font (incl. `color=` = text colour), z-order of an addressed shape |
+| **add-table-slide** | PowerPoint | ✅ `bridge-powerpoint` native table on an existing slide, or `slide=new title="…"` to create a titled slide for it (PowerPointApi 1.8) |
 | **append-page** | OneNote | ✅ `bridge-onenote` (synthesis + inline citation tags) |
 | **reply-mail** | Outlook | ✅ `bridge-outlook` (reviewable `displayReplyForm`) |
 | **create-mail** | Outlook | ✅ `bridge-outlook` (reviewable `displayNewMessageForm`; `compose` verb, unaddressed by default) |
 | **post-message** (+ Adaptive Card) | Teams | ✅ `teams` (reviewable compose) |
 | set-speaker-notes | PowerPoint | 🟡 modeled — **not advertised** (no host write path in current typings; always degraded, so un-advertised per ADR-0006) |
-| add-shape, add-table-slide, format-shape, delete/move/duplicate slide | PowerPoint | 🟡 modeled — **not advertised** until the bridge has tested host write paths and inverses |
+| delete/move/duplicate slide | PowerPoint | 🟡 modeled — **not advertised** until the bridge has tested host write paths and inverses |
 | create-event, create-task | Outlook/Graph | 🟡 modeled — **not advertised** (no `actuate()` case yet) |
 
 **Every write verb maps to a CLI verb and is composition-bearing.** `WRITE_VERB_TO_KIND`:

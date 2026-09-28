@@ -535,6 +535,7 @@ function paramsFromInvoke(
       p.pageTitle = props.title ?? args[0] ?? '';
       break;
     case 'add-shape':
+      withPositionalSlide(p, args);
       p.shape = {
         shapeType: shapeTypeFromProp(props.shapeType ?? props.type),
         ...(props.geometryType ? { geometryType: props.geometryType } : {}),
@@ -551,9 +552,20 @@ function paramsFromInvoke(
         ...numberProp(props, 'height'),
       };
       break;
-    case 'add-table-slide':
+    case 'add-table-slide': {
+      withPositionalSlide(p, args);
+      // The shape models write unprompted: `/add-table-slide "Title" "A | B" "1 | 2" …` — a title then
+      // one quoted row each, cells split by `|` or a tab. Taken as a new titled slide with that table.
+      const quoted = positionalTable(args, props);
+      if (quoted) {
+        p.target = { ...((p.target ?? {}) as object), slideId: 'new' };
+        p.slide = { title: quoted.title, bullets: [] };
+      } else if (props.title) {
+        // `title=` names the slide `slide=new` creates (the bridge rejects it for an existing slide).
+        p.slide = { title: props.title, bullets: [] };
+      }
       p.tableGrid = {
-        rows: rowsFromProp(props.rows ?? props.tsv ?? ''),
+        rows: quoted?.rows ?? rowsFromProp(props.rows ?? props.tsv ?? ''),
         hasHeaders: boolFromProp(props.headers, true),
         ...numberProp(props, 'left'),
         ...numberProp(props, 'top'),
@@ -561,6 +573,7 @@ function paramsFromInvoke(
         ...numberProp(props, 'height'),
       };
       break;
+    }
     case 'apply-slide-layout':
       p.layout = {
         ...(props.layoutId ? { layoutId: props.layoutId } : {}),
@@ -586,16 +599,21 @@ function paramsFromInvoke(
         args[0];
       const target = selector ? powerpointShapeTargetFromSelector(selector) : undefined;
       if (target && !('error' in target)) p.target = target;
+      const style = { ...props, ...dottedStyleProps(args) };
+      // `color=` / `textColor=` on a shape mean its TEXT colour (the fill is `fill=`); models write
+      // them far more often than `fontColor=`, which used to leave the text unchanged.
+      const textColor = style.textColor ?? style.color;
+      if (textColor && !style.fontColor) style.fontColor = textColor;
       p.shapeFormat = {
-        ...(props.fill ? { fill: props.fill } : {}),
-        ...(props.line ? { line: props.line } : {}),
+        ...((style.fill ?? style.fillColor) ? { fill: style.fill ?? style.fillColor } : {}),
+        ...((style.line ?? style.lineColor) ? { line: style.line ?? style.lineColor } : {}),
         ...(props.zOrder === 'front' ||
         props.zOrder === 'back' ||
         props.zOrder === 'forward' ||
         props.zOrder === 'backward'
           ? { zOrder: props.zOrder }
           : {}),
-        ...(shapeFontFromProps(props) ? { font: shapeFontFromProps(props) } : {}),
+        ...(shapeFontFromProps(style) ? { font: shapeFontFromProps(style) } : {}),
       };
       break;
     }
@@ -728,6 +746,57 @@ function rowsFromProp(value: string): string[][] {
 }
 
 type ShapeFont = NonNullable<NonNullable<ActuationRequest['params']['shapeFormat']>['font']>;
+
+/**
+ * A PowerPoint slide reference given as the first positional argument (`/add-shape pp:slide:257#0
+ * …`, `/add-shape 2 …`) when no `slide=` prop is present. Only reference-shaped tokens qualify, so a
+ * quoted title or free text is never taken as a slide.
+ */
+function withPositionalSlide(p: Record<string, unknown>, args: string[]): void {
+  const target = (p.target ?? {}) as NonNullable<ActuationRequest['params']['target']>;
+  const first = args[0]?.trim();
+  if (target.slideId || !first) return;
+  if (/^(?:pp:)?slide:\S+$/i.test(first) || /^\d+(?:#\d+)?$/.test(first) || /^last$/i.test(first)) {
+    p.target = { ...target, slideId: first };
+  }
+}
+
+/**
+ * `/add-table-slide "Title" "A | B" "1 | 2"` → `{ title, rows }`, when no slide/rows props were given
+ * and every row after the title splits into the same number (≥ 2) of `|`- or tab-separated cells.
+ * A flat list of single cells stays unparsed: its columns can't be inferred.
+ */
+function positionalTable(
+  args: string[],
+  props: Record<string, string>,
+): { title: string; rows: string[][] } | undefined {
+  if (props.slide || props.slideId || props.rows || props.tsv || args.length < 3) return undefined;
+  const [title, ...rowTexts] = args.map((arg) => arg.trim());
+  const rows = rowTexts.map((row) => row.split(/\s*\|\s*|\t/).map((cell) => cell.trim()));
+  const width = rows[0]?.length ?? 0;
+  if (!title || width < 2 || rows.some((row) => row.length !== width)) return undefined;
+  return { title, rows };
+}
+
+/**
+ * `/format-shape` style keys written with a dot (`fill.color=#0000FF font.color=#FFFFFF
+ * font.size=24`) — the key tokenizer only accepts `\w[\w-]*`, so these arrive as positional tokens.
+ * Mapped onto the flat props the shaping below reads (fill / line / fontColor / fontSize / …).
+ */
+function dottedStyleProps(args: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const arg of args) {
+    const m = /^(fill|line|font)\.(color|size|bold|italic|underline|name)=(.+)$/i.exec(arg.trim());
+    if (!m) continue;
+    const [, group, field, raw] = m;
+    const value = raw!.replace(/^["']|["']$/g, '');
+    const g = group!.toLowerCase();
+    const f = field!.toLowerCase();
+    if (g === 'font') out[`font${f[0]!.toUpperCase()}${f.slice(1)}`] = value;
+    else if (f === 'color') out[g] = value;
+  }
+  return out;
+}
 
 function shapeFontFromProps(props: Record<string, string>): ShapeFont | undefined {
   const font: ShapeFont = {};
@@ -944,6 +1013,9 @@ export function renderCommandBootstrap(manifest: CapabilityManifest, task?: stri
     'grid',
     'suggest',
     'shape',
+    // PowerPoint's primary create verb; without its signature, models reach for the specialized
+    // `/add-table-slide` (which only adds to an EXISTING slide). Listed only where advertised.
+    'slide',
     'mail',
     'post',
     'finish',

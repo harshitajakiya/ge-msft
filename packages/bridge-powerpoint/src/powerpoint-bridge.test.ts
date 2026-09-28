@@ -28,6 +28,8 @@ interface ShapeSeed {
   type?: string;
   /** Simulated `placeholderFormat.containedType` for a 'Placeholder' shape (null = text/empty). */
   containedType?: string | null;
+  /** Simulated `placeholderFormat.type` for a 'Placeholder' shape (e.g. 'Title', 'Body'). */
+  placeholderType?: string;
   /** The host refuses this shape's text frame even though its type suggests one. */
   refuseText?: boolean;
   /** Simulated ShapeFill.foregroundColor (undefined until first set). */
@@ -51,7 +53,16 @@ interface ShapeSeed {
 interface SlideSeed {
   id: string;
   shapes: ShapeSeed[];
+  /**
+   * Set on a just-added slide: its `id` is PROVISIONAL until the current `PowerPoint.run` ends, when
+   * it becomes this settled id. Like PowerPoint for the web, writes addressed through the
+   * provisional id (`getItem(id)` or the `items` list) fail the next sync; `getItemAt` works.
+   */
+  settledId?: string;
 }
+
+/** A no-op write check, for fakes not reached through a slide. */
+const NO_GUARD = (): void => undefined;
 interface DeckSeed {
   slides: SlideSeed[];
   /** Zero-based indices of selected slides (the bridge reads items[0]). */
@@ -59,6 +70,8 @@ interface DeckSeed {
   selectedShapeIds: string[];
   insertedDecks: string[];
   insertedDeckOptions: PowerPoint.InsertSlideOptions[];
+  /** Shapes a `slides.add()` slide gets from the default layout (default: title + body placeholders). */
+  newSlideShapes?: ShapeSeed[];
   addedShapes: Array<{
     slideId: string;
     kind: 'textBox' | 'geometric' | 'line' | 'table';
@@ -102,7 +115,10 @@ class FakeTable {
 }
 
 class FakeFont {
-  constructor(private readonly font: NonNullable<ShapeSeed['font']>) {}
+  constructor(
+    private readonly font: NonNullable<ShapeSeed['font']>,
+    private readonly guard: () => void = NO_GUARD,
+  ) {}
   load(_p?: string): this {
     return this;
   }
@@ -110,50 +126,60 @@ class FakeFont {
     return this.font.bold ?? null;
   }
   set bold(v: boolean) {
+    this.guard();
     this.font.bold = v;
   }
   get italic(): boolean | null {
     return this.font.italic ?? null;
   }
   set italic(v: boolean) {
+    this.guard();
     this.font.italic = v;
   }
   get underline(): string | null {
     return this.font.underline ?? null;
   }
   set underline(v: 'None' | 'Single') {
+    this.guard();
     this.font.underline = v;
   }
   get color(): string | null {
     return this.font.color ?? null;
   }
   set color(v: string) {
+    this.guard();
     this.font.color = v;
   }
   get size(): number | null {
     return this.font.size ?? null;
   }
   set size(v: number) {
+    this.guard();
     this.font.size = v;
   }
   get name(): string | null {
     return this.font.name ?? null;
   }
   set name(v: string) {
+    this.guard();
     this.font.name = v;
   }
 }
 
 class FakeTextRange {
   readonly font: FakeFont;
-  constructor(private readonly shape: ShapeSeed) {
+  constructor(
+    private readonly shape: ShapeSeed,
+    private readonly guard: () => void = NO_GUARD,
+  ) {
     this.shape.font ??= {};
-    this.font = new FakeFont(this.shape.font);
+    this.font = new FakeFont(this.shape.font, guard);
   }
   get text(): string {
     return this.shape.text;
   }
   set text(v: string) {
+    this.guard();
     this.shape.text = v;
   }
   load(_p?: string): this {
@@ -210,8 +236,9 @@ class FakeShape {
     readonly shape: ShapeSeed,
     readonly id: string,
     readonly isNullObject = false,
+    guard: () => void = NO_GUARD,
   ) {
-    this.frame = { textRange: new FakeTextRange(shape) };
+    this.frame = { textRange: new FakeTextRange(shape, guard) };
     this.fill = new FakeShapeFill(shape);
     this.lineFormat = new FakeShapeLineFormat(shape);
   }
@@ -227,12 +254,17 @@ class FakeShape {
     if (refuses) pendingHostError = `InvalidArgument: ${this.type} ${this.id} has no TextFrame`;
     return this.frame;
   }
-  get placeholderFormat(): { containedType: string | null; load(_p?: string): unknown } {
+  get placeholderFormat(): {
+    containedType: string | null;
+    type: string;
+    load(_p?: string): unknown;
+  } {
     if (this.type !== 'Placeholder') {
       pendingHostError = `GeneralException: ${this.id} is not a placeholder`;
     }
     const format = {
       containedType: this.shape.containedType ?? null,
+      type: this.shape.placeholderType ?? 'Unsupported',
       load: () => format,
     };
     return format;
@@ -255,11 +287,19 @@ class FakeShapeCollection {
     private readonly slide: SlideSeed,
     private readonly deck: DeckSeed,
     private readonly slideId: string,
+    private readonly guard: () => void = NO_GUARD,
   ) {
-    this.items = slide.shapes.map((s, i) => new FakeShape(s, `${slide.id}-shape-${i}`));
+    this.items = slide.shapes.map(
+      (s, i) => new FakeShape(s, `${slide.id}-shape-${i}`, false, guard),
+    );
   }
   load(_p?: string): this {
     return this;
+  }
+  getItemAt(index: number): FakeShape {
+    const shape = this.items[index];
+    if (!shape) throw new Error(`fake-powerpoint: no shape at ${index}`);
+    return shape;
   }
   getItemOrNullObject(id: string): FakeShape {
     const index = this.items.findIndex((shape) => shape.id === id);
@@ -276,7 +316,8 @@ class FakeShapeCollection {
   private append(seed: ShapeSeed): FakeShape {
     const id = `${this.slideId}-shape-${this.items.length}`;
     this.slide.shapes.push(seed);
-    const shape = new FakeShape(seed, id);
+    this.guard();
+    const shape = new FakeShape(seed, id, false, this.guard);
     this.items.push(shape);
     return shape;
   }
@@ -330,15 +371,27 @@ class FakeSlide {
     private readonly slide: SlideSeed,
     readonly index: number,
     private readonly seed: DeckSeed,
+    /**
+     * Reached via `getItemAt` (by position) rather than by id or the `items` list. Like Office.js,
+     * LOADING the proxy re-addresses it by id (`slides.getItem(id)`), so `load()` clears this.
+     */
+    private byPosition = false,
   ) {}
+  /** A write through this slide: fails the next sync if it addresses a provisional id. */
+  private readonly guard = (): void => {
+    if (this.slide.settledId !== undefined && !this.byPosition) {
+      pendingHostError = 'InvalidParam passed to GetItem(id)';
+    }
+  };
   get id(): string {
     return this.slide.id;
   }
   load(_p?: string): this {
+    this.byPosition = false;
     return this;
   }
   get shapes(): FakeShapeCollection {
-    return new FakeShapeCollection(this.slide, this.seed, this.slide.id);
+    return new FakeShapeCollection(this.slide, this.seed, this.slide.id, this.guard);
   }
   setSelectedShapes(shapeIds: string[]): void {
     this.seed.selectedIndices = [this.index];
@@ -361,19 +414,23 @@ class FakeSlideCollection {
   }
   add(): void {
     this.addCalls += 1;
+    const n = this.seed.slides.length + 1;
     this.seed.slides.push({
-      id: `sim-slide-${this.seed.slides.length + 1}`,
-      shapes: [
-        { text: '', zOrderCalls: [] },
-        { text: '', zOrderCalls: [] },
-      ],
+      id: `provisional-${n}#0`,
+      settledId: `sim-slide-${n}`,
+      shapes: (
+        this.seed.newSlideShapes ?? [
+          { text: '', type: 'Placeholder', placeholderType: 'Title', zOrderCalls: [] },
+          { text: '', type: 'Placeholder', placeholderType: 'Body', zOrderCalls: [] },
+        ]
+      ).map((shape) => ({ ...shape, zOrderCalls: [] })),
     });
     this.items = this.seed.slides.map((s, i) => new FakeSlide(s, i, this.seed));
   }
   getItemAt(index: number): FakeSlide {
     const slide = this.seed.slides[index];
     if (!slide) throw new Error(`fake-powerpoint: no slide at ${index}`);
-    return new FakeSlide(slide, index, this.seed);
+    return new FakeSlide(slide, index, this.seed, true);
   }
   getItem(id: string): FakeSlide {
     const index = this.seed.slides.findIndex((s) => s.id === id);
@@ -385,6 +442,14 @@ class FakeSlideCollection {
 
 class FakePresentation {
   insertCalls: string[] = [];
+  /** Simulated `PageSetup` (PowerPointApi 1.10): a 10" × 5.625" deck, in points. */
+  readonly pageSetup = {
+    slideWidth: 720,
+    slideHeight: 405,
+    load(_p?: string): unknown {
+      return this;
+    },
+  };
   constructor(private readonly seed: DeckSeed) {}
   get slides(): FakeSlideCollection {
     return new FakeSlideCollection(this.seed);
@@ -462,7 +527,17 @@ function install(seed: DeckSeed, opts: InstallOpts = {}): Installed {
     run: async <T>(cb: (ctx: FakeContext) => Promise<T>): Promise<T> => {
       const ctx = new FakeContext(seed);
       ctxRef.ctx = ctx;
-      return cb(ctx);
+      try {
+        return await cb(ctx);
+      } finally {
+        // A request completed: just-added slides get their real ids (see SlideSeed.settledId).
+        for (const slide of seed.slides) {
+          if (slide.settledId !== undefined) {
+            slide.id = slide.settledId;
+            delete slide.settledId;
+          }
+        }
+      }
     },
   };
 
@@ -476,8 +551,11 @@ function install(seed: DeckSeed, opts: InstallOpts = {}): Installed {
         isSetSupported: (name: string, version?: string): boolean => {
           const max = reqs[name];
           if (max === undefined) return false;
-          const v = version ? Number.parseFloat(version) : 0;
-          return v <= max;
+          // `max` 1.x = highest supported minor version; >= 2 = every 1.x set. Compare minors as
+          // integers so '1.10' is newer than '1.5' (a float compare would read it as 1.1).
+          if (max >= 2) return true;
+          const minor = Number((version ?? '1.0').split('.')[1] ?? '0');
+          return minor <= Math.round((max - 1) * 10);
         },
       },
       document: {
@@ -1037,6 +1115,42 @@ describe('PowerPointBridge.readRange', () => {
     expect(await new PowerPointBridge().readRange('slide:99')).toEqual([]);
   });
 
+  it('accepts a host slide id and the pp:slide: ref form', async () => {
+    installed = install(deck(SAMPLE_SLIDES, []));
+    for (const selector of ['s2', 'slide:s2', 'pp:slide:s2', 'pp:slide:2']) {
+      const ctx = await new PowerPointBridge().readRange(selector);
+      expect(new Set(ctx.map((c) => c.ref.anchor?.locator))).toEqual(new Set(['slide:s2']));
+    }
+    const last = await new PowerPointBridge().readRange('last');
+    expect(last.some((c) => c.ref.anchor?.locator === 'slide:s3')).toBe(true);
+  });
+
+  it('lists the slide shapes with ids, types and the title, so shape commands can address them', async () => {
+    installed = install(
+      deck(
+        [
+          {
+            id: 's1',
+            shapes: [
+              { text: 'FY26 Plan', type: 'Placeholder', placeholderType: 'Title', zOrderCalls: [] },
+              { text: 'Grow ARR', type: 'TextBox', zOrderCalls: [] },
+              { text: '', type: 'Image', zOrderCalls: [] },
+            ],
+          },
+        ],
+        [],
+      ),
+    );
+    const ctx = await new PowerPointBridge().readRange('slide:1');
+    const text = ctx.map((c) => (c.value.as === 'text' ? c.value.text : '')).join('\n');
+    expect(text).toContain(
+      'for shape commands use slide=1 and shape=<id>; shape=title is id s1-shape-0',
+    );
+    expect(text).toContain('- id s1-shape-0 · Placeholder · title · "FY26 Plan"');
+    expect(text).toContain('- id s1-shape-1 · TextBox · "Grow ARR"');
+    expect(text).toContain('- id s1-shape-2 · Image');
+  });
+
   it('returns [] when the host predates TextRange.text (1.4)', async () => {
     installed = install(deck(SAMPLE_SLIDES, []), { requirements: { PowerPointApi: 1.3 } });
     expect(await new PowerPointBridge().readRange('slide:1')).toEqual([]);
@@ -1246,8 +1360,351 @@ describe('PowerPointBridge.actuate insert-slide (native compose)', () => {
   });
 });
 
+describe('PowerPointBridge.actuate insert-slide (layout without placeholders)', () => {
+  it('matches placeholders by type, not position', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [
+      { text: '', type: 'Placeholder', placeholderType: 'Body' },
+      { text: '', type: 'Placeholder', placeholderType: 'Title' },
+    ];
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      insertSlide({ slide: { title: 'Typed', bullets: ['One', 'Two'] } }),
+    );
+    expect(res.ok).toBe(true);
+    const appended = d.slides[d.slides.length - 1];
+    expect(appended?.shapes[1]?.text).toBe('Typed');
+    expect(appended?.shapes[0]?.text).toBe('One\nTwo');
+    expect(d.addedShapes).toEqual([]);
+  });
+
+  it('adds sized text boxes when the default layout has no placeholders (Blank layout)', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [];
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      insertSlide({ slide: { title: 'this is a test slide', bullets: ['First', 'Second'] } }),
+    );
+    expect(res.ok).toBe(true);
+    const appended = d.slides[d.slides.length - 1];
+    expect(appended?.shapes.map((shape) => shape.text)).toEqual([
+      'this is a test slide',
+      '• First\n• Second',
+    ]);
+    // Both boxes sit inside the 720 × 405 pt slide the host reported.
+    for (const added of d.addedShapes) {
+      const box = added.options as PowerPoint.ShapeAddOptions;
+      expect(added.kind).toBe('textBox');
+      expect((box.left ?? 0) + (box.width ?? 0)).toBeLessThanOrEqual(720);
+      expect((box.top ?? 0) + (box.height ?? 0)).toBeLessThanOrEqual(405);
+    }
+    expect(appended?.shapes[0]?.font?.bold).toBe(true);
+  });
+
+  it('adds only a body text box when the layout has a title placeholder but no body', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [{ text: '', type: 'Placeholder', placeholderType: 'Title' }];
+    installed = install(d);
+    await new PowerPointBridge().actuate(
+      insertSlide({ slide: { title: 'Heading', bullets: ['Point'] } }),
+    );
+    const appended = d.slides[d.slides.length - 1];
+    expect(appended?.shapes.map((shape) => shape.text)).toEqual(['Heading', '• Point']);
+    expect(d.addedShapes.map((added) => added.kind)).toEqual(['textBox']);
+  });
+
+  it('falls back to the first two placeholders in order below PowerPointApi 1.8', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [
+      { text: '', type: 'Placeholder' },
+      { text: '', type: 'Placeholder' },
+    ];
+    installed = install(d, { requirements: { PowerPointApi: 1.5 } });
+    await new PowerPointBridge().actuate(insertSlide({ slide: { title: 'T', bullets: ['B'] } }));
+    const appended = d.slides[d.slides.length - 1];
+    expect(appended?.shapes.map((shape) => shape.text)).toEqual(['T', 'B']);
+  });
+
+  it('writes to the just-added slide by position and reports its settled id (PowerPoint web)', async () => {
+    // The fake gives a new slide a provisional id until the request ends, and fails writes addressed
+    // through that id — as PowerPoint for the web does (5010 "InvalidParam passed to GetItem(id)").
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [];
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      insertSlide({ slide: { title: 'Q4 plan', bullets: ['hire 5 engineers'] } }),
+    );
+    expect(res).toMatchObject({ ok: true, location: 'slide:sim-slide-2' });
+    expect(d.slides[1]?.shapes.map((shape) => shape.text)).toEqual([
+      'Q4 plan',
+      '• hire 5 engineers',
+    ]);
+  });
+
+  it('includes the PowerPoint error code when a write is uncertain', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [
+      { text: '', type: 'Placeholder', placeholderType: 'Title', refuseText: true },
+    ];
+    installed = install(d);
+    const sync = vi.spyOn(FakeContext.prototype, 'sync').mockImplementation(function (
+      this: FakeContext,
+    ) {
+      this.syncs += 1;
+      const error = pendingHostError;
+      pendingHostError = undefined;
+      return error
+        ? Promise.reject(Object.assign(new Error(error), { code: 'GeneralException' }))
+        : Promise.resolve();
+    });
+    try {
+      const res = await new PowerPointBridge().actuate(
+        insertSlide({ slide: { title: 'T', bullets: [] } }),
+      );
+      expect(res.error?.code).toBe('outcome_unknown');
+      expect(res.error?.message).toContain('(PowerPoint: GeneralException)');
+    } finally {
+      sync.mockRestore();
+    }
+  });
+
+  it('never writes onto another slide when the new one cannot be identified (co-author race)', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    installed = install(d);
+    // A co-author's slide lands in the same moment: two new ids appear, so neither is trusted.
+    const add = vi.spyOn(FakeSlideCollection.prototype, 'add').mockImplementation(() => {
+      d.slides.push({ id: 'coauthor-slide', shapes: [{ text: 'Theirs' }] });
+      d.slides.push({ id: 'ours', shapes: [] });
+    });
+    try {
+      const res = await new PowerPointBridge().actuate(
+        insertSlide({ slide: { title: 'T', bullets: ['B'] } }),
+      );
+      expect(res).toMatchObject({ ok: false, error: { code: 'outcome_unknown' } });
+      expect(d.slides.find((slide) => slide.id === 'coauthor-slide')?.shapes[0]?.text).toBe(
+        'Theirs',
+      );
+    } finally {
+      add.mockRestore();
+    }
+  });
+
+  it('reports an unconfirmed write as outcome-unknown, never as success', async () => {
+    const d = deck([{ id: 's1', shapes: [{ text: 'Existing' }] }], [0]);
+    d.newSlideShapes = [
+      { text: '', type: 'Placeholder', placeholderType: 'Title', refuseText: true },
+    ];
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      insertSlide({ slide: { title: 'T', bullets: [] } }),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error?.code).toBe('outcome_unknown');
+  });
+});
+
+describe('PowerPointBridge shape and slide references (tests 48–51)', () => {
+  it('changes only the title when a shape command names slide 1 / shape title', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(setShapeText('1', 'title', 'FY26 Plan'));
+    expect(res).toMatchObject({ ok: true, location: 'shape:s1:s1-shape-0' });
+    expect(d.slides[0]?.shapes.map((shape) => shape.text)).toEqual([
+      'FY26 Plan',
+      '99.5% contracted\nMonthly window',
+    ]);
+  });
+
+  it('formats the title shape resolved by slide number and "title"', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      formatShape({
+        target: { slideId: '1', shapeId: 'title' },
+        shapeFormat: { fill: '#0000FF', font: { color: '#FFFFFF' } },
+      }),
+    );
+    expect(res.ok).toBe(true);
+    expect(d.slides[0]?.shapes[0]).toMatchObject({
+      fillColor: '#0000FF',
+      font: { color: '#FFFFFF' },
+    });
+    expect(d.slides[0]?.shapes[1]?.fillColor).toBeUndefined();
+  });
+
+  it('names the valid shapes when a shape reference does not resolve, and writes nothing', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(setShapeText('1', 'nope', 'x'));
+    expect(res).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(res.error?.message).toContain('Use shape=title');
+    expect(res.error?.message).toContain('id s1-shape-0 (TextBox)');
+    expect(d.slides[0]?.shapes[0]?.text).toBe('SLA Terms');
+  });
+
+  it('rejects a format-shape with no formatting instead of reporting a no-op as applied', async () => {
+    // Live: `/format-shape shape:257#0:6 text="…"` came back "applied" having changed nothing.
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      formatShape({ target: { slideId: '1', shapeId: 'title' }, shapeFormat: {} }),
+    );
+    expect(res).toMatchObject({ ok: false, error: { code: 'no_format' } });
+    expect(res.error?.message).toContain('shape pp:shape:<slide>:<shape> "text"');
+  });
+
+  it('does not treat a shape number as a position (ids are small numbers too)', async () => {
+    // Live: `shape pp:shape:1:1 "FY26 Plan"` resolved "1" as the 1st shape — the logo image.
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(setShapeText('1', '1', 'FY26 Plan'));
+    expect(res).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(res.error?.message).toContain('Use shape=title');
+    expect(d.slides[0]?.shapes.map((shape) => shape.text)).toEqual([
+      'SLA Terms',
+      '99.5% contracted\nMonthly window',
+    ]);
+  });
+
+  it('refuses to write text into a picture, with a message naming shape=title', async () => {
+    const d = deck(
+      [{ id: 's1', shapes: [{ text: '', type: 'Image' }, { text: 'Deck title' }] }],
+      [0],
+    );
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(setShapeText('1', 's1-shape-0', 'x'));
+    expect(res).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(res.error?.message).toContain('is a Image and has no text');
+    expect(d.slides[0]?.shapes[1]?.text).toBe('Deck title');
+  });
+
+  it('rejects title= on an existing slide instead of silently ignoring it', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate({
+      changeId: asChangeId('table-title-existing'),
+      kind: 'add-table-slide',
+      surface: 'powerpoint',
+      params: {
+        target: { slideId: '2' },
+        slide: { title: 'Ignored?', bullets: [] },
+        tableGrid: { hasHeaders: false, rows: [['a']] },
+      },
+    });
+    expect(res).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(res.error?.message).toContain('only used with slide=new');
+    expect(d.addedShapes).toEqual([]);
+  });
+
+  it('rejects a text box with no text, and a shape with no position, before writing', async () => {
+    // Live: `/add-shape slide:2 {"text": …, "position": "bottom"}` → an empty box at the top-left.
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const bridge = new PowerPointBridge();
+    const empty = await bridge.actuate(
+      addShape({
+        target: { slideId: '2' },
+        shape: { shapeType: 'textBox', left: 72, top: 300, width: 300, height: 40 },
+      }),
+    );
+    expect(empty).toMatchObject({ ok: false, error: { code: 'no_text' } });
+    const unplaced = await bridge.actuate(
+      addShape({ target: { slideId: '2' }, shape: { shapeType: 'textBox', text: 'Draft' } }),
+    );
+    expect(unplaced).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(unplaced.error?.message).toContain('missing left, top, width, height');
+    expect(unplaced.error?.message).toContain('The slide is 720 × 405 pt');
+    expect(d.addedShapes).toEqual([]);
+  });
+
+  it('accepts pp:slide:<id> and rejects an off-slide position with the slide size', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const bridge = new PowerPointBridge();
+    const ok = await bridge.actuate(
+      addShape({
+        target: { slideId: 'pp:slide:s2' },
+        shape: { shapeType: 'textBox', text: 'Draft', left: 72, top: 330, width: 400, height: 40 },
+      }),
+    );
+    expect(ok.ok).toBe(true);
+    expect(d.addedShapes[0]?.slideId).toBe('s2');
+    const off = await bridge.actuate(
+      addShape({
+        target: { slideId: '2' },
+        shape: { shapeType: 'textBox', text: 'Draft', left: 100, top: 500, width: 300, height: 50 },
+      }),
+    );
+    expect(off).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(off.error?.message).toContain('outside the slide, which is 720 × 405 pt');
+    expect(d.addedShapes).toHaveLength(1);
+  });
+
+  it('creates a titled slide for /add-table-slide slide=new and puts the table on it', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate({
+      changeId: asChangeId('table-new'),
+      kind: 'add-table-slide',
+      surface: 'powerpoint',
+      params: {
+        target: { slideId: 'new' },
+        slide: { title: 'Key risks', bullets: [] },
+        tableGrid: {
+          hasHeaders: true,
+          rows: [
+            ['Risk', 'Owner'],
+            ['Vendor delay', 'Pat'],
+          ],
+        },
+      },
+    });
+    expect(res).toMatchObject({ ok: true });
+    expect(res.location).toMatch(/^shape:sim-slide-4:/);
+    // With no position given, the table goes below the title, inside the 720 × 405 slide.
+    const tableAdd = d.addedShapes.find((added) => added.kind === 'table');
+    expect(tableAdd?.options).toMatchObject({ left: 48, top: 109, width: 624 });
+    // Undo removes the slide this command created (and the table with it).
+    expect(res.inverse).toEqual({ op: 'delete-object', objectType: 'slide', name: 'sim-slide-4' });
+    const created = d.slides[3];
+    expect(created?.shapes[0]?.text).toBe('Key risks');
+    expect(created?.shapes.find((shape) => shape.tableGrid)?.tableGrid).toEqual([
+      ['Risk', 'Owner'],
+      ['Vendor delay', 'Pat'],
+    ]);
+    // The existing last slide was not touched.
+    expect(d.slides[2]?.shapes.map((shape) => shape.text)).toEqual([
+      'Risk Summary',
+      'SLA gap flagged',
+    ]);
+  });
+
+  it('adds a title text box for slide=new on a layout without placeholders', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    d.newSlideShapes = [];
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate({
+      changeId: asChangeId('table-new-blank'),
+      kind: 'add-table-slide',
+      surface: 'powerpoint',
+      params: {
+        target: { slideId: 'new' },
+        slide: { title: 'Key risks', bullets: [] },
+        tableGrid: { hasHeaders: false, rows: [['Vendor delay', 'Pat']] },
+      },
+    });
+    expect(res.ok).toBe(true);
+    expect(d.slides[3]?.shapes.map((shape) => shape.type ?? 'TextBox')).toEqual([
+      'TextBox',
+      'Table',
+    ]);
+    expect(d.slides[3]?.shapes[0]?.text).toBe('Key risks');
+  });
+});
+
 describe('PowerPointBridge.actuate set-shape-text', () => {
-  it.each([1, 3])(
+  // Syncs: 1 resolve slide, 2 resolve shape, 3 shape exists?, 4 prior text read, 5 the write.
+  it.each([1, 2, 3, 4, 5])(
     'distinguishes a failed pre-read from a dispatched text write (sync %s)',
     async (failAt) => {
       const d = deck(SAMPLE_SLIDES, [0]);
@@ -1264,12 +1721,13 @@ describe('PowerPointBridge.actuate set-shape-text', () => {
         const result = await new PowerPointBridge().actuate(
           setShapeText('s2', 's2-shape-1', 'New text'),
         );
+        const beforeWrite = failAt < 5;
         expect(result).toMatchObject({
           ok: false,
-          error: { code: failAt === 1 ? 'target_conflict' : 'outcome_unknown' },
+          error: { code: beforeWrite ? 'target_conflict' : 'outcome_unknown' },
         });
-        expect(result.recoveryPending).toBe(failAt === 1 ? undefined : true);
-        expect(d.slides[1]?.shapes[1]?.text).toBe(failAt === 1 ? 'Pat, Sam' : 'New text');
+        expect(result.recoveryPending).toBe(beforeWrite ? undefined : true);
+        expect(d.slides[1]?.shapes[1]?.text).toBe(beforeWrite ? 'Pat, Sam' : 'New text');
       } finally {
         sync.mockRestore();
       }
@@ -1341,12 +1799,21 @@ describe('PowerPointBridge.actuate add-shape', () => {
     installed = install(d);
     const sync = vi
       .spyOn(FakeContext.prototype, 'sync')
+      // The read-only slide lookup succeeds; the sync that carries the write fails.
+      .mockResolvedValueOnce(undefined)
       .mockRejectedValue(new Error('Office disconnected'));
     try {
       const result = await new PowerPointBridge().actuate(
         addShape({
           target: { slideId: 's1' },
-          shape: { shapeType: 'textBox', text: 'Created' },
+          shape: {
+            shapeType: 'textBox',
+            text: 'Created',
+            left: 72,
+            top: 300,
+            width: 300,
+            height: 40,
+          },
         }),
       );
       expect(result).toMatchObject({
@@ -1407,7 +1874,15 @@ describe('PowerPointBridge.actuate add-shape', () => {
     const res = await new PowerPointBridge().actuate(
       addShape({
         target: { slideId: 's1' },
-        shape: { shapeType: 'geometric', geometryType: 'Rectangle', fill: '#0F6CBD', width: 120 },
+        shape: {
+          shapeType: 'geometric',
+          geometryType: 'Rectangle',
+          fill: '#0F6CBD',
+          left: 72,
+          top: 96,
+          width: 120,
+          height: 60,
+        },
       }),
     );
 
@@ -1421,7 +1896,17 @@ describe('PowerPointBridge.actuate add-shape', () => {
     const d = deck(SAMPLE_SLIDES, [0]);
     installed = install(d);
     const res = await new PowerPointBridge().actuate(
-      addShape({ target: { slideId: 's3' }, shape: { shapeType: 'line', connectorType: 'elbow' } }),
+      addShape({
+        target: { slideId: 's3' },
+        shape: {
+          shapeType: 'line',
+          connectorType: 'elbow',
+          left: 72,
+          top: 300,
+          width: 300,
+          height: 40,
+        },
+      }),
     );
 
     expect(res.ok).toBe(true);
@@ -1453,6 +1938,55 @@ describe('PowerPointBridge.actuate add-shape', () => {
 
     expect(res).toMatchObject({ ok: false, error: { code: 'unsupported' } });
     expect(installed.ctxRef.ctx).toBeUndefined();
+  });
+
+  it.each([
+    ['last', 's3'],
+    ['LAST', 's3'],
+    ['2', 's2'],
+    ['slide:s1', 's1'],
+  ])('resolves slide=%s to the right slide before writing', async (ref, slideId) => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      addShape({
+        target: { slideId: ref },
+        shape: { shapeType: 'textBox', text: 'x', left: 72, top: 300, width: 300, height: 40 },
+      }),
+    );
+    expect(res.ok).toBe(true);
+    expect(d.addedShapes[0]?.slideId).toBe(slideId);
+    expect(res.location).toMatch(new RegExp(`^shape:${slideId}:`));
+  });
+
+  it('points a missing-slide add-shape / add-table-slide at the slide command', async () => {
+    installed = install(deck(SAMPLE_SLIDES, [0]));
+    const bridge = new PowerPointBridge();
+    const table = await bridge.actuate(
+      addTableSlide({ tableGrid: { hasHeaders: false, rows: [['hire 5 engineers']] } }),
+    );
+    const shape = await bridge.actuate(addShape({ shape: { shapeType: 'textBox', text: 'x' } }));
+    for (const res of [table, shape]) {
+      expect(res).toMatchObject({ ok: false, error: { code: 'no_target' } });
+      expect(res.error?.message).toContain('slide "Title" "bullet"');
+      expect(res.error?.message).toContain('a slide id from the outline, a slide number, or last');
+      // The runtime escapes < > in results; keep the hint free of them so it reads cleanly.
+      expect(res.error?.message).not.toMatch(/[<>]/);
+    }
+    expect(table.error?.message).toContain('slide=new title=');
+  });
+
+  it('fails with the valid slides, not "outcome uncertain", when the slide does not exist', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(
+      addShape({ target: { slideId: 'nope' }, shape: { shapeType: 'textBox', text: 'x' } }),
+    );
+    expect(res).toMatchObject({ ok: false, degraded: true, error: { code: 'target_conflict' } });
+    expect(res.error?.message).toContain('Slide "nope" was not found');
+    expect(res.error?.message).toContain('or "last"');
+    expect(res.error?.message).toContain('s1, s2, s3');
+    expect(d.addedShapes).toEqual([]);
   });
 
   it('degrades to unsupported on a pre-1.4 host without touching the host', async () => {
@@ -1507,7 +2041,9 @@ describe('PowerPointBridge.actuate format-shape', () => {
     const sync = vi.spyOn(FakeContext.prototype, 'sync').mockImplementation(function (
       this: FakeContext,
     ) {
-      if (++calls === 3) return Promise.reject(new Error('Office disconnected'));
+      // Syncs 1–2 resolve the slide and shape; 3 exists?, 4 fill prior read, 5 line prior read
+      // (which also carries the queued fill write).
+      if (++calls === 5) return Promise.reject(new Error('Office disconnected'));
       return original.call(this);
     });
     try {
@@ -1678,6 +2214,9 @@ describe('PowerPointBridge.actuate add-table-slide', () => {
     installed = install(d);
     const sync = vi
       .spyOn(FakeContext.prototype, 'sync')
+      // The read-only slide-size and slide lookups succeed; the sync that carries the write fails.
+      .mockResolvedValueOnce(undefined)
+      .mockResolvedValueOnce(undefined)
       .mockRejectedValue(new Error('Office disconnected'));
     try {
       const result = await new PowerPointBridge().actuate(
@@ -1784,6 +2323,25 @@ describe('PowerPointBridge.actuate add-table-slide', () => {
     expect(emptyRow).toMatchObject({ ok: false, error: { code: 'no_table' } });
 
     expect(installed.ctxRef.ctx).toBeUndefined();
+  });
+
+  it('resolves slide=last and rejects an unknown slide before writing', async () => {
+    const d = deck(SAMPLE_SLIDES, [0]);
+    installed = install(d);
+    const ok = await new PowerPointBridge().actuate(
+      addTableSlide({
+        target: { slideId: 'last' },
+        tableGrid: { hasHeaders: false, rows: [['a']] },
+      }),
+    );
+    expect(ok.ok).toBe(true);
+    expect(d.addedShapes[0]?.slideId).toBe('s3');
+
+    const missing = await new PowerPointBridge().actuate(
+      addTableSlide({ target: { slideId: 's9' }, tableGrid: { hasHeaders: false, rows: [['a']] } }),
+    );
+    expect(missing).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
+    expect(d.addedShapes).toHaveLength(1);
   });
 
   it('degrades to unsupported below PowerPointApi 1.8 without touching the host', async () => {

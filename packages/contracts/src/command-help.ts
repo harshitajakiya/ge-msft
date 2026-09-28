@@ -347,33 +347,43 @@ export const COMMAND_HELP = {
     'reply <commentId> "text"',
     'you need to reply to an existing comment id',
   ),
-  slide: genericWrite(
-    'slide',
-    'slide "Title" "bullet" ... OR slide "Title" (<table expr>)',
-    'you need to insert a new PowerPoint slide',
-  ),
+  slide: {
+    ...genericWrite(
+      'slide',
+      'slide "Title" "bullet" ... OR slide "Title" (<table expr>)',
+      'you need to add a new PowerPoint slide with a title and bullet points. For a native TABLE on a new slide use /add-table-slide slide=new title="…" rows="a\\tb\\nc\\td" instead (slide would flatten rows into bullets)',
+    ),
+    // A concrete line first: command cards show the first example free of `<placeholders>`.
+    examples: [
+      'slide "Q4 plan" "Hire 5 engineers" "Ship firmware 4.2"',
+      'slide "Title" "bullet" ... OR slide "Title" (<table expr>)',
+    ],
+  },
   shape: {
     command: 'shape',
     useWhen:
-      'the user wants to revise text inside one existing PowerPoint shape or text box, not create a new slide',
+      'the user wants to change the text of one existing PowerPoint shape or text box, e.g. retitle a slide (shape=title), not create a new slide',
+    // <slide> = slide id, slide number or last; <shape> = shape id or title (no shape numbers).
     syntax: 'shape <pp:shape:slideId:shapeId> "new text"',
     discovery: [
+      'read slide:<n>',
       'list shape',
       'properties <pp:shape:slideId:shapeId>',
       'open <pp:shape:slideId:shapeId>',
       'inspect <pp:shape:slideId:shapeId>',
     ],
     sequence: [
-      'List or inspect shape refs.',
+      'Use shape=title for the slide title; otherwise read slide:<n> (lists each shape id) or list shape.',
       'Open the exact shape if the user needs visual confirmation.',
       'Emit one shape command with the smallest replacement text.',
       'Wait for preview, approval, and result before done.',
     ],
     examples: [
+      'shape pp:shape:1:title "FY26 Plan"',
       'shape pp:shape:s2:s2-shape-1 "Q4 outlook improved; hiring remains gated by margin."',
     ],
     doNot: [
-      'Do not use a bare shape id.',
+      'Do not use a bare shape id; name the slide too (pp:shape:<slide>:<shape>).',
       'Do not rewrite the whole slide to change one text box.',
       'Do not mutate a chart/table/image as plain text.',
     ],

@@ -262,6 +262,27 @@ describe('command surface — implicit intent inference', () => {
     ).toBeUndefined();
   });
 
+  it('routes edit verbs such as "change" to the planner, not to plain chat', () => {
+    // Live: "Change the title…" went to chat, and the model claimed a change that never happened.
+    for (const raw of [
+      "Change the title on slide 1 to 'FY26 Plan'",
+      'Set the heading colour to blue',
+      'Rename the table to Q3 Sales',
+      'Replace the subtitle with the new date',
+      'Format the title shape on slide 1 blue with white text',
+      'Move the logo to the bottom right',
+    ]) {
+      expect(
+        shouldUsePlannerForFreeText(['draft', 'rewrite'], { ...base, raw, instruction: raw }),
+      ).toBe(true);
+    }
+    // Questions stay in chat.
+    const question = 'what should change in this deck before Friday?';
+    expect(
+      shouldUsePlannerForFreeText(['draft'], { ...base, raw: question, instruction: question }),
+    ).toBe(false);
+  });
+
   it('routes arbitrary action-like Excel text to the planner instead of classifying exact intent', () => {
     expect(
       inferImplicitIntent('excel', ['rewrite', 'visualize'], {
