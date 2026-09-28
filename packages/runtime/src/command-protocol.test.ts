@@ -117,6 +117,31 @@ describe('compileCommand', () => {
     expect(bad).toMatchObject({ error: expect.stringContaining('recognized property') });
   });
 
+  it('encodes a plain-text /add-attachment (text= or content=) so the model never writes base64', () => {
+    for (const key of ['text', 'content']) {
+      const c = compileCommand(
+        {
+          verb: 'invoke',
+          kind: 'add-attachment',
+          props: { name: 'hello.txt', [key]: 'Hello from Gemini ✓' },
+          args: [],
+        } as never,
+        { surface: 'outlook', mintChangeId: () => asChangeId('cid') },
+      );
+      expect(c).toMatchObject({
+        request: {
+          kind: 'add-attachment',
+          params: {
+            attachment: {
+              name: 'hello.txt',
+              base64: Buffer.from('Hello from Gemini ✓', 'utf8').toString('base64'),
+            },
+          },
+        },
+      });
+    }
+  });
+
   it('compiles `reply` → comment-reply with a commentId target (Zod-valid, changeId minted once)', () => {
     const ids: string[] = [];
     const mintOnce = () => {

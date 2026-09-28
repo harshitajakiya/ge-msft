@@ -160,14 +160,18 @@ function installOutlook(
       },
     });
 
-    const attachmentApi =
-      (transport: AttachmentAdded['transport']) =>
-      (
+    const attachmentApi = (transport: AttachmentAdded['transport']) =>
+      function (
+        this: unknown,
         value: string,
         name: string,
         options: { isInline?: boolean },
         cb: ResultCb<string>,
-      ): void => {
+      ): void {
+        // Like Office.js, the method needs its item as `this`; a detached call throws.
+        if (typeof this !== 'object' || this === null || !('body' in this)) {
+          throw new TypeError('add*AttachmentAsync called without its mail item');
+        }
         attachmentsAdded.push({
           transport,
           value,

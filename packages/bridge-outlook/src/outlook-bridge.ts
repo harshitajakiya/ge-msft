@@ -355,8 +355,9 @@ export class OutlookBridge implements DocBridge {
       return actuationError(req, 'no_compose', 'Attachment APIs are unavailable on this draft.');
     }
     try {
+      // Call ON the draft: Office.js methods need their item as `this`, and a detached call fails.
       const id = await getAsync<string>((cb) =>
-        add(plan.value, plan.name, { isInline: plan.isInline }, cb),
+        add.call(resolved.draft, plan.value, plan.name, { isInline: plan.isInline }, cb),
       );
       return {
         ok: true,
@@ -566,7 +567,7 @@ const ATTACHMENT_ERROR_MESSAGES: Record<
   string
 > = {
   no_attachment:
-    'add-attachment needs params.attachment base64, https uri, or itemId plus a file name',
+    'add-attachment needs a file name plus one of: text="plain text", base64=<base64>, or uri="https://…" — e.g. /add-attachment name="hello.txt" text="Hello"',
   attachment_too_large: 'add-attachment base64 payload exceeds the 3 MB ceiling',
   invalid_attachment: 'add-attachment payload is not valid base64, or its uri is not an https link',
 };
