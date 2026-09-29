@@ -148,17 +148,21 @@ export function slideContextRef(
   };
 }
 
+/**
+ * A shape as attachable context. Titled by its host id, never its position: the model copies the
+ * number from the title into `pp:shape:<slide>:<shape>`, and "Shape 1" (the first shape, often a
+ * decorative line) read as shape id 1 targeted nothing, or the wrong shape.
+ */
 export function shapeContextRef(
   slide: Pick<SlideElement, 'index' | 'slideId'>,
   shape: ShapeElement,
-  ordinal: number,
 ): ContextRef {
   const slideId = slide.slideId ?? String(slide.index);
   return {
     id: `pp:shape:${slideId}:${shape.shapeId}`,
     kind: 'shape',
     surface: 'powerpoint',
-    title: `Shape ${ordinal + 1} on slide ${slide.index + 1}`,
+    title: `Shape ${shape.shapeId} on slide ${slide.index + 1}`,
     ...(shape.text.trim() ? { preview: shape.text.trim().slice(0, 120) } : {}),
     live: true,
     anchor: {
@@ -172,11 +176,10 @@ export function shapeContextRef(
 export function selectedShapeToContext(
   slide: Pick<SlideElement, 'index' | 'slideId'>,
   shape: ShapeElement,
-  ordinal = 0,
 ): ResolvedContext[] {
   const text = shape.text.trim();
   if (!text) return [];
-  const ref = shapeContextRef(slide, shape, ordinal);
+  const ref = shapeContextRef(slide, shape);
   return [
     {
       ref,

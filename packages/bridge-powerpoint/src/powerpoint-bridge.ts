@@ -105,8 +105,10 @@ export class PowerPointBridge implements DocBridge {
       if (first) {
         const slide = await readSlide(ctx, first);
         refs.push(slideContextRef(slide));
-        for (const [index, shape] of (slide.shapes ?? []).entries()) {
-          refs.push(shapeContextRef(slide, shape, index));
+        // Only shapes with text: an empty line or picture has nothing to attach (resolving it gives
+        // no context), and listing it gave the model a "shape" to aim a text write at.
+        for (const shape of slide.shapes ?? []) {
+          if (shape.text.trim()) refs.push(shapeContextRef(slide, shape));
         }
       }
       refs.push({ id: 'pp:deck', kind: 'document', surface: 'powerpoint', title: 'Whole deck' });
@@ -316,8 +318,8 @@ export class PowerPointBridge implements DocBridge {
         if (!TEXT_SHAPE_TYPES.has(shape.type)) {
           return slideNotFound(
             req,
-            `Shape id ${target.shapeId} is a ${shape.type} and has no text. Use shape=title for the ` +
-              'slide title, or the id of a text box.',
+            `Shape id ${target.shapeId} is a ${shape.type} and has no text. For the slide title use ` +
+              `shape pp:shape:${slideId}:title "…", or the id of a text box.`,
           );
         }
         const range = shape.textFrame.textRange;
@@ -1456,18 +1458,55 @@ async function resolveShapeTarget(
   }
   // No shape ordinals: PowerPoint shape ids are small numbers themselves (2, 3, 4…), so "2" would be
   // ambiguous between "id 2" and "the 2nd shape". Only exact ids and `title` resolve.
-  const shown = shapes
-    .slice(0, 12)
-    .map((shape) => `id ${shape.id} (${shape.type})`)
-    .join(', ');
+  const shown = await describeShapes(ctx, shapes.slice(0, 12));
+  // Spell out both ref forms: the `shape` command takes `pp:shape:<slide>:<shape>`, the `/…-shape`
+  // kinds take `shape=`. A model told only "shape=title" retries the `shape` command blind.
+  const slideKey = slideRef
+    .trim()
+    .replace(/^(?:pp:)?slide:/i, '')
+    .slice(0, 64);
   return {
     error:
-      `Shape ${JSON.stringify(key.slice(0, 64))} was not found on that slide. Use shape=title for ` +
-      `the slide title, or one of its shape ids: ${shown || 'the slide has no shapes'}.`,
+      `Shape ${JSON.stringify(key.slice(0, 64))} was not found on that slide (there are no shape ` +
+      `numbers). For the slide title use title as the shape: shape pp:shape:${slideKey}:title "…" ` +
+      `(or shape=title on /format-shape). Otherwise use one of its shape ids: ` +
+      `${shown || 'the slide has no shapes'}.`,
   };
 }
 
-/** A slide's title shape: its Title/CenterTitle placeholder, else the first shape with text. */
+/**
+ * `id 86 (TextBox, title: "What is Tokenomics?"), id 85 (GeometricShape, no text)` — for a
+ * not-found shape error. Ids and types alone left the model guessing: after "Shape 1" failed on a
+ * deck whose first shape was a decorative line, it wrote the title into the line. Shape text is
+ * document content: quoted, single-line and clipped, like the read listing. Read-only.
+ */
+async function describeShapes(
+  ctx: PowerPoint.RequestContext,
+  shapes: PowerPoint.Shape[],
+): Promise<string> {
+  let texts = new Map<PowerPoint.Shape, string>();
+  let title: PowerPoint.Shape | undefined;
+  try {
+    const readable = await withoutNonTextPlaceholders(ctx, shapes.filter(isReadableShape));
+    texts = await readShapeContent(ctx, readable);
+    title = await findTitleShape(ctx, shapes);
+  } catch {
+    // Fall back to ids and types.
+  }
+  return shapes
+    .map((shape) => {
+      const text = (texts.get(shape) ?? '').replace(/\s+/g, ' ').trim();
+      const clipped = text.length > 40 ? `${text.slice(0, 40)}…` : text;
+      const label = shape === title ? 'title: ' : '';
+      return `id ${shape.id} (${shape.type}, ${text ? `${label}${JSON.stringify(clipped)}` : 'no text'})`;
+    })
+    .join(', ');
+}
+
+/**
+ * A slide's title shape: its Title/CenterTitle placeholder, else the text shape set in the largest
+ * type (see {@link largestTextShape}), else the first shape with text.
+ */
 async function findTitleShape(
   ctx: PowerPoint.RequestContext,
   shapes: PowerPoint.Shape[],
@@ -1476,7 +1515,46 @@ async function findTitleShape(
   if (titleShape && isSet('PowerPointApi', '1.8')) return titleShape;
   const readable = await withoutNonTextPlaceholders(ctx, shapes.filter(isReadableShape));
   const texts = await readShapeContent(ctx, readable);
-  return readable.find((shape) => shape.type !== 'Table' && (texts.get(shape) ?? '').trim());
+  const withText = readable.filter(
+    (shape) => shape.type !== 'Table' && (texts.get(shape) ?? '').trim(),
+  );
+  if (withText.length <= 1) return withText[0];
+  return (await largestTextShape(ctx, withText, texts)) ?? withText[0];
+}
+
+/**
+ * The shape whose first visible character is set in the largest font (ties: the topmost). Decks
+ * without title placeholders (Google Slides exports, hand-built slides) often put a small label
+ * ("SECTION / 01") above the title, so the first shape with text was the label, not the title.
+ * The first character, because a whole range with mixed runs reports `font.size` as null. One
+ * read-only sync; undefined when the host reports no sizes.
+ */
+async function largestTextShape(
+  ctx: PowerPoint.RequestContext,
+  shapes: PowerPoint.Shape[],
+  texts: Map<PowerPoint.Shape, string>,
+): Promise<PowerPoint.Shape | undefined> {
+  try {
+    const probes = shapes.map((shape) => {
+      const text = texts.get(shape) ?? '';
+      const first = shape.textFrame.textRange.getSubstring(Math.max(0, text.search(/\S/)), 1);
+      first.font.load('size');
+      shape.load('top');
+      return [shape, first] as const;
+    });
+    await ctx.sync();
+    let best: { shape: PowerPoint.Shape; size: number; top: number } | undefined;
+    for (const [shape, first] of probes) {
+      const size = first.font.size ?? 0;
+      const top = shape.top ?? Number.POSITIVE_INFINITY;
+      if (size > 0 && (!best || size > best.size || (size === best.size && top < best.top))) {
+        best = { shape, size, top };
+      }
+    }
+    return best?.shape;
+  } catch {
+    return undefined;
+  }
 }
 
 /** The deck's slide size when the host reports it (PowerPointApi 1.10), else undefined. */

@@ -49,6 +49,10 @@ interface ShapeSeed {
   tableGrid?: string[][];
   /** Recorded setZOrder positions applied to this shape. */
   zOrderCalls?: string[];
+  /** Simulated `Shape.top` in points. */
+  top?: number;
+  /** Font size of the text's first character (`textRange.getSubstring(i, 1).font.size`). */
+  firstCharSize?: number;
 }
 interface SlideSeed {
   id: string;
@@ -185,6 +189,11 @@ class FakeTextRange {
   load(_p?: string): this {
     return this;
   }
+  getSubstring(start: number, length: number): { font: { size: number | null; load(): void } } {
+    // Like the host: a substring outside the text fails the next sync.
+    if (start + length > this.shape.text.length) pendingHostError = 'InvalidArgument: substring';
+    return { font: { size: this.shape.firstCharSize ?? null, load: () => undefined } };
+  }
 }
 
 class FakeShapeFill {
@@ -244,6 +253,9 @@ class FakeShape {
   }
   get type(): string {
     return this.shape.type ?? 'TextBox';
+  }
+  get top(): number | undefined {
+    return this.shape.top;
   }
   get textFrame(): { textRange: FakeTextRange } {
     const contained = this.shape.containedType;
@@ -701,16 +713,37 @@ describe('PowerPointBridge.listContext', () => {
     expect(refs[1]).toMatchObject({
       id: 'pp:shape:s2:s2-shape-0',
       kind: 'shape',
-      title: 'Shape 1 on slide 2',
+      title: 'Shape s2-shape-0 on slide 2',
       preview: 'Roster',
     });
     expect(refs[2]).toMatchObject({
       id: 'pp:shape:s2:s2-shape-1',
       kind: 'shape',
-      title: 'Shape 2 on slide 2',
+      title: 'Shape s2-shape-1 on slide 2',
       preview: 'Pat, Sam',
     });
     expect(refs[3]).toMatchObject({ id: 'pp:deck', kind: 'document' });
+  });
+
+  it('lists only shapes with text, titled by shape id (not position)', async () => {
+    installed = install(
+      deck(
+        [
+          {
+            id: 's1',
+            shapes: [
+              { text: '', type: 'GeometricShape', zOrderCalls: [] }, // a decorative line
+              { text: 'What is Tokenomics?', zOrderCalls: [] },
+            ],
+          },
+        ],
+        [0],
+      ),
+    );
+    const shapes = (await new PowerPointBridge().listContext()).filter((r) => r.kind === 'shape');
+    expect(shapes.map((r) => [r.id, r.title])).toEqual([
+      ['pp:shape:s1:s1-shape-1', 'Shape s1-shape-1 on slide 1'],
+    ]);
   });
 
   it('lists only the deck when nothing is selected', async () => {
@@ -1537,9 +1570,84 @@ describe('PowerPointBridge shape and slide references (tests 48–51)', () => {
     installed = install(d);
     const res = await new PowerPointBridge().actuate(setShapeText('1', 'nope', 'x'));
     expect(res).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
-    expect(res.error?.message).toContain('Use shape=title');
-    expect(res.error?.message).toContain('id s1-shape-0 (TextBox)');
+    expect(res.error?.message).toContain('pp:shape:1:title');
+    expect(res.error?.message).toContain('id s1-shape-0 (TextBox, title: "SLA Terms")');
+    expect(res.error?.message).toContain(
+      'id s1-shape-1 (TextBox, "99.5% contracted Monthly window")',
+    );
     expect(d.slides[0]?.shapes[0]?.text).toBe('SLA Terms');
+  });
+
+  it('marks shapes without text in the not-found listing', async () => {
+    installed = install(
+      deck(
+        [
+          {
+            id: 's1',
+            shapes: [
+              { text: '', type: 'GeometricShape', zOrderCalls: [] },
+              { text: 'What is Tokenomics?', zOrderCalls: [] },
+            ],
+          },
+        ],
+        [0],
+      ),
+    );
+    const res = await new PowerPointBridge().actuate(setShapeText('1', '1', 'Devx plan'));
+    expect(res.error?.message).toContain(
+      'id s1-shape-0 (GeometricShape, no text), id s1-shape-1 (TextBox, title: "What is Tokenomics?")',
+    );
+  });
+
+  it('takes the largest text as the title when the slide has no title placeholder', async () => {
+    // Live (a Google Slides export): a 12 pt "TOKENOMICS / 01" label sits above the 28.5 pt title,
+    // and "first shape with text" retitled the label.
+    const d = deck(
+      [
+        {
+          id: 's2',
+          shapes: [
+            { text: 'TOKENOMICS / 01', top: 36, firstCharSize: 12, zOrderCalls: [] },
+            { text: '', type: 'GeometricShape', top: 57, zOrderCalls: [] },
+            {
+              text: 'What do we mean by Tokenomics?',
+              top: 76,
+              firstCharSize: 28.5,
+              zOrderCalls: [],
+            },
+            { text: 'NOT JUST A FORMULA', top: 153, firstCharSize: 8.25, zOrderCalls: [] },
+          ],
+        },
+      ],
+      [0],
+    );
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(setShapeText('1', 'title', 'Devx plan'));
+    expect(res).toMatchObject({ ok: true, location: 'shape:s2:s2-shape-2' });
+    expect(d.slides[0]?.shapes.map((shape) => shape.text)).toEqual([
+      'TOKENOMICS / 01',
+      '',
+      'Devx plan',
+      'NOT JUST A FORMULA',
+    ]);
+  });
+
+  it('breaks a title font-size tie by the topmost shape', async () => {
+    const d = deck(
+      [
+        {
+          id: 's1',
+          shapes: [
+            { text: 'Lower', top: 200, firstCharSize: 30, zOrderCalls: [] },
+            { text: 'Upper', top: 40, firstCharSize: 30, zOrderCalls: [] },
+          ],
+        },
+      ],
+      [0],
+    );
+    installed = install(d);
+    const res = await new PowerPointBridge().actuate(setShapeText('1', 'title', 'New'));
+    expect(res).toMatchObject({ ok: true, location: 'shape:s1:s1-shape-1' });
   });
 
   it('rejects a format-shape with no formatting instead of reporting a no-op as applied', async () => {
@@ -1559,7 +1667,7 @@ describe('PowerPointBridge shape and slide references (tests 48–51)', () => {
     installed = install(d);
     const res = await new PowerPointBridge().actuate(setShapeText('1', '1', 'FY26 Plan'));
     expect(res).toMatchObject({ ok: false, error: { code: 'target_conflict' } });
-    expect(res.error?.message).toContain('Use shape=title');
+    expect(res.error?.message).toContain('pp:shape:1:title');
     expect(d.slides[0]?.shapes.map((shape) => shape.text)).toEqual([
       'SLA Terms',
       '99.5% contracted\nMonthly window',

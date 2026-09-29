@@ -88,9 +88,9 @@ one the add-in accepted, and the command failed. The add-in now accepts the form
 When something still doesn't fit, the add-in now **explains what to do** instead of just failing,
 and the model fixes it on the next turn. That happened in every test:
 
-- a shape it couldn't find → *"Use shape=title for the slide title, or one of its shape ids: …"*
+- a shape it couldn't find → *"Shape "1" was not found on that slide (there are no shape numbers). For the slide title use title as the shape: shape pp:shape:1:title "…" (or shape=title on /format-shape). Otherwise use one of its shape ids: …"*
 - a position below the slide → *"That position is outside the slide, which is 720 × 405 pt …"*
-- text into a picture → *"Shape id 2 is a Image and has no text. Use shape=title …"*
+- text into a picture → *"Shape id 2 is a Image and has no text. For the slide title use shape pp:shape:1:title "…", or the id of a text box."*
 - `/format-shape` with no formatting → rejected, instead of reporting "applied" for a change that
   did nothing
 - a text box with no text, or a shape with no position → rejected, with the slide's size and a
@@ -236,6 +236,63 @@ case or wiring in as a feature.
 
 ---
 
+## A second deck: titles without a title placeholder
+
+**Status:** fixed and confirmed live. On "Tokenomics LLM Evaluation Framework" (40 slides, a Google
+Slides export), "change the title to Devx plan on the first slide instead of what is tokenomics"
+now changes slide 1's title and nothing else.
+
+### For everyone
+
+The test deck worked, but on this deck the same request changed nothing. Three things were wrong:
+
+1. **The add-in listed shapes by position.** It told the model about "Shape 1" and "Shape 2" on the
+   slide. Here "Shape 1" is a thin decorative line above the title. The model aimed at "shape 1",
+   which is either no shape at all or the line.
+2. **"The title" meant "the first shape with text."** Slides made in Google Slides have no real
+   title box. On most of this deck's slides the first text is a small label such as
+   "TOKENOMICS / 01", which sits above the actual title.
+3. **When a shape wasn't found, the error listed shape numbers and types only**, so the model
+   could not tell the line from the title. On its second try it picked the line.
+
+**Fixes:** shapes are now listed by their real id ("Shape 86 on slide 1"), and empty shapes such
+as lines aren't listed at all. "Title" now means the text set in the largest font; if two are the
+same size, the one nearer the top wins. The "not found" error now shows each shape's text and
+marks the title.
+
+**Still worth knowing:** with **Whole deck** attached (40 slides), Gemini Enterprise switched to
+its Python code-execution tool. It then tried to run the add-in's commands as Python, which fails
+every time, and gave up after 41 and 60 steps. With Whole deck removed, the same request
+worked in one pass. A single-slide edit doesn't need the whole deck attached.
+
+### For developers
+
+| Change | File | What it does |
+|---|---|---|
+| Shape refs titled by id | `capture.ts` `shapeContextRef` | `Shape <shapeId> on slide <n>`, not `Shape <ordinal>`; the `ordinal` parameter is gone |
+| Only text shapes listed | `powerpoint-bridge.ts` `listContext` | skips shapes with no text: they resolve to no context and were write targets for text |
+| Title fallback by font size | `powerpoint-bridge.ts` `findTitleShape` → `largestTextShape` | without a Title/CenterTitle placeholder, pick the text shape whose first visible character (`textRange.getSubstring(i, 1).font.size`) is largest, ties → smallest `top`. The first character because a range with mixed runs reports `font.size: null`. One read-only sync; falls back to the first shape with text if the host reports no sizes |
+| Descriptive not-found error | `powerpoint-bridge.ts` `describeShapes` | `id 85 (GeometricShape, no text), id 86 (TextBox, title: "What is Tokenomics?")`; shape text is quoted, single-line, clipped to 40 characters |
+
+Measured on the deck: title placeholders none; per-slide first-character sizes 12 pt (section
+label) vs 28.5 pt (title) on slides 2, 3, 5 and 6. On slide 4, the largest text is
+"Now what do we optimize?" (34.5 pt).
+
+Live runs, same prompt:
+
+| Run | Context | What happened |
+|---|---|---|
+| Before the fix | Whole deck | `shape pp:shape:1:1` (not found) → code execution → `shape pp:shape:1:title` + `shape pp:shape:1:85` (the line); plan rejected, nothing written |
+| After the fix | Whole deck | code execution from turn 1 (`Python code execution requested` / `failed`), 60 steps, nothing written |
+| After the fix | none | `inspect "Slide 1"` → `read` → `shape pp:shape:1:86 "Devx plan"`: "1 changes applied; 0 not applied"; shape 85 unchanged |
+
+Tests (`powerpoint-bridge.test.ts`): `listContext` skips empty shapes and titles by id; title by
+largest font over a smaller label above it; font-size tie → topmost; the not-found listing shows
+text, `no text` and the title marker. The fake host gained `Shape.top` and
+`TextRange.getSubstring().font.size`.
+
+---
+
 ## Open issues
 
 | Issue | Impact | Plan |
@@ -243,4 +300,6 @@ case or wiring in as a feature.
 | The approval card shows relative refs (`slide=last`, `shape=title`, `slide=2`), which resolve at apply time | the user approves the command text, not a concrete shape; the resolved target appears afterwards in `location` | resolve refs during the dry run and show "slide 1 · title (id 3)" on the card; apply exact ids only |
 | Stale Microsoft sign-in token: `WIF token exchange failed … stale to sign-in` | the add-in fails and doesn't recover on its own (seen during testing) | on this error, fetch a fresh Entra token and retry the exchange once |
 | Compiled-deck insert not wired in (test 47) | multi-slide decks insert as N separate slides | wire `buildPowerPointDeckImportRequest` into the plan flow, or correct the test case |
+| With a large attachment (Whole deck, 40 slides), Gemini Enterprise may switch to its Python code-execution tool and try to run the command block as Python | the task loops until it gives up; nothing is written. The runtime's re-prompt ("Hosted Python/code execution is not a valid executor response") does not stop it | engine-side: turn off code execution for the assistant used by the add-in, or check whether a request option can disable it. Client-side: don't resend the whole-deck attachment on command turns for a single-slide edit |
+| The model sometimes guesses shape ids (`pp:shape:1:0` … `1:10`) in its reasoning before reading the slide | none seen: only the read and the final correct command ran. But on a deck with small shape ids a guess could hit a real shape | the approval card should name the concrete shape (see the first row) |
 | The model often needs one corrective turn (e.g. `pp:shape:1:1` → `title`) | the activity summary still counts the rejected attempt | show resolved examples in the core signatures; the error hints already make the fix one turn |

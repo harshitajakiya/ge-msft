@@ -1732,7 +1732,7 @@
     },
     "shape": {
       "command": "shape",
-      "useWhen": "the user wants to change the text of one existing PowerPoint shape or text box, e.g. retitle a slide (shape=title), not create a new slide",
+      "useWhen": "the user wants to change the text of one existing PowerPoint shape or text box, e.g. retitle a slide (pp:shape:<n>:title), not create a new slide",
       "syntax": "shape <pp:shape:slideId:shapeId> \"new text\"",
       "discovery": [
         "read slide:<n>",
@@ -1742,7 +1742,7 @@
         "inspect <pp:shape:slideId:shapeId>"
       ],
       "sequence": [
-        "Use shape=title for the slide title; otherwise read slide:<n> (lists each shape id) or list shape.",
+        "For the slide title use pp:shape:<n>:title; otherwise read slide:<n> (lists each shape id) or list shape.",
         "Open the exact shape if the user needs visual confirmation.",
         "Emit one shape command with the smallest replacement text.",
         "Wait for preview, approval, and result before done."
@@ -1753,6 +1753,7 @@
       ],
       "doNot": [
         "Do not use a bare shape id; name the slide too (pp:shape:<slide>:<shape>).",
+        "Do not guess a shape number: pp:shape:1:1 means shape id 1, not the first shape.",
         "Do not rewrite the whole slide to change one text box.",
         "Do not mutate a chart/table/image as plain text."
       ],
