@@ -276,7 +276,12 @@ export class OutlookBridge implements DocBridge {
           error: actuationError(
             req,
             'no_compose',
-            'The active mail item is not an open draft (compose mode).',
+            // Say what to do instead: without it the model tried every draft verb in turn, then
+            // `compose` (a NEW message) when a reply was wanted.
+            'The open item is a received message, not a draft being written. To reply to it, use ' +
+              'mail "reply text" (opens a reply draft for review); to start a new message, use ' +
+              'compose "Subject" "body". set-subject, set-body, set-recipients and add-attachment ' +
+              'only work when the task pane is opened from a draft.',
           ),
         };
   }

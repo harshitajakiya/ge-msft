@@ -683,6 +683,8 @@ describe('OutlookBridge.actuate set-recipients (in-place draft edit)', () => {
       act('set-recipients', { mail: { to: ['a@acme.com'] } }),
     );
     expect(res).toMatchObject({ ok: false, error: { code: 'no_compose' } });
+    // The corrective names the reply verb, so the model replies instead of opening a new message.
+    expect(res.error?.message).toContain('mail "reply text"');
   });
 });
 
