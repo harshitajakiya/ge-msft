@@ -141,7 +141,12 @@ def _parse_grid_body(body: str):
 # value"` (with spaces) intact — mirrors the TS `tokenizeArgs` used by table/chart/cf. A
 # `key="quoted"` / `key=bare` match yields a prop; anything else is positional (a range, a chart
 # type, a bare CF mode like `databar`).
-_TOKENIZE = re.compile(r'(\w[\w-]*)="([^"]*)"|(\w[\w-]*)=(\S+)|"([^"]*)"|(\S+)')
+# Double-quoted values honour \" and \\ escapes (mirrors tokenizeArgs in command-grammar.ts).
+_TOKENIZE = re.compile(r'(\w[\w-]*)="((?:[^"\\]|\\.)*)"|(\w[\w-]*)=(\S+)|"((?:[^"\\]|\\.)*)"|(\S+)')
+
+
+def _unescape(value: str) -> str:
+    return re.sub(r'\\(["\\])', r'\1', value)
 
 
 def _tokenize_args(rest: str):
@@ -149,11 +154,11 @@ def _tokenize_args(rest: str):
     props = {}
     for m in _TOKENIZE.finditer(rest):
         if m.group(1) is not None:
-            props[m.group(1)] = m.group(2)
+            props[m.group(1)] = _unescape(m.group(2))
         elif m.group(3) is not None:
             props[m.group(3)] = m.group(4)
         elif m.group(5) is not None:
-            positional.append(m.group(5))
+            positional.append(_unescape(m.group(5)))
         else:
             positional.append(m.group(6))
     return positional, props

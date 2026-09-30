@@ -766,6 +766,23 @@ describe('command-grammar — format (k=v pairs, values with # $ , . %)', () => 
     });
   });
 
+  it('keeps escaped quotes inside a double-quoted value (OOXML attributes)', () => {
+    const xml = '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr></w:p>';
+    const escaped = xml.replace(/"/g, '\\"');
+    expect(parseCommandLine(`/insert-ooxml ooxml="${escaped}"`)).toEqual({
+      verb: 'invoke',
+      kind: 'insert-ooxml',
+      props: { ooxml: xml },
+      args: [],
+    });
+    expect(parseCommandLine(`/insert-ooxml "${escaped}"`)).toEqual({
+      verb: 'invoke',
+      kind: 'insert-ooxml',
+      props: {},
+      args: [xml],
+    });
+  });
+
   it('flattens a model-written JSON style after the range', () => {
     expect(
       parseCommandLine(

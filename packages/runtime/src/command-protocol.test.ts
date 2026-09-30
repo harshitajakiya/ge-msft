@@ -190,6 +190,14 @@ describe('compileCommand', () => {
     });
   });
 
+  it('takes positional OOXML for /insert-ooxml when ooxml= is missing', () => {
+    const c = compileCommand(
+      { verb: 'invoke', kind: 'insert-ooxml', props: {}, args: ['<w:p/>'] } as never,
+      { surface: 'word', mintChangeId: () => asChangeId('cid') },
+    );
+    expect(c).toMatchObject({ request: { kind: 'insert-ooxml', params: { ooxml: '<w:p/>' } } });
+  });
+
   it('takes positional text for /replace-selection when text= is missing', () => {
     const c = compileCommand(
       { verb: 'invoke', kind: 'replace-selection', props: {}, args: ['Short new text.'] } as never,

@@ -146,7 +146,7 @@ export interface InsertOoxmlPlan {
 
 export function planInsertOoxml(req: ActuationRequest): InsertOoxmlPlan {
   const p = req.params;
-  const ooxml = p.ooxml ?? '';
+  const ooxml = toOoxmlPackage(p.ooxml ?? '');
   return {
     ...(p.target?.matchText ? { matchText: p.target.matchText } : {}),
     ...(p.target?.contextHint ? { contextHint: p.target.contextHint } : {}),
@@ -308,4 +308,36 @@ export function planFindReplace(req: ActuationRequest): FindReplacePlan {
     matchWholeWord: p.findReplace?.matchWholeWord ?? false,
     hasFindReplace: p.findReplace !== undefined && (p.findReplace.find ?? '').trim().length > 0,
   };
+}
+
+const W_NS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
+const RELS_PART =
+  '<pkg:part pkg:name="/_rels/.rels" pkg:contentType="application/vnd.openxmlformats-package.relationships+xml">' +
+  '<pkg:xmlData><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+  '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
+  '</Relationships></pkg:xmlData></pkg:part>';
+
+/**
+ * `range.insertOoxml` accepts only a complete flat-OPC package (`pkg:package` with a `/_rels/.rels`
+ * part and a `/word/document.xml` part); anything less is rejected by Word and comes back as an
+ * uncertain outcome. Models usually write just the paragraph, so wrap what they give: a bare
+ * fragment (`<w:p>…`), a `<w:body>`, a `<w:document>`, or a package missing its `.rels` part.
+ */
+export function toOoxmlPackage(raw: string): string {
+  const xml = raw.trim().replace(/^<\?xml[^>]*\?>\s*/, '');
+  if (!xml) return '';
+  if (xml.startsWith('<pkg:package')) {
+    if (xml.includes('pkg:name="/_rels/.rels"')) return xml;
+    return xml.replace(/^<pkg:package[^>]*>/, (open) => open + RELS_PART);
+  }
+  const body = xml.startsWith('<w:body') ? xml : `<w:body>${xml}</w:body>`;
+  const document = xml.startsWith('<w:document')
+    ? xml
+    : `<w:document xmlns:w="${W_NS}">${body}</w:document>`;
+  return (
+    '<pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">' +
+    RELS_PART +
+    '<pkg:part pkg:name="/word/document.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml">' +
+    `<pkg:xmlData>${document}</pkg:xmlData></pkg:part></pkg:package>`
+  );
 }

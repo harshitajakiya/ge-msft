@@ -1068,12 +1068,16 @@ function unquoteSetValue(value: string): string {
 function tokenizeArgs(rest: string): { positional: string[]; props: Record<string, string> } {
   const positional: string[] = [];
   const props: Record<string, string> = {};
-  const re = /(\w[\w-]*)="([^"]*)"|(\w[\w-]*)=(\S+)|"([^"]*)"|'([^']*)'(\S*)|(\S+)/g;
+  // Double-quoted values honour `\"` and `\\` escapes, so a quoted value can carry quotes — an
+  // OOXML attribute (`ooxml="<w:pStyle w:val=\"Heading1\"/>"`) was otherwise cut at the first one.
+  const re =
+    /(\w[\w-]*)="((?:[^"\\]|\\.)*)"|(\w[\w-]*)=(\S+)|"((?:[^"\\]|\\.)*)"|'([^']*)'(\S*)|(\S+)/g;
+  const unescape = (s: string): string => s.replace(/\\(["\\])/g, '$1');
   let m: RegExpExecArray | null;
   while ((m = re.exec(rest)) !== null) {
-    if (m[1] !== undefined) props[m[1]] = m[2]!;
+    if (m[1] !== undefined) props[m[1]] = unescape(m[2]!);
     else if (m[3] !== undefined) props[m[3]] = m[4]!;
-    else if (m[5] !== undefined) positional.push(m[5]);
+    else if (m[5] !== undefined) positional.push(unescape(m[5]));
     else if (m[6] !== undefined) positional.push(`'${m[6]}'${m[7] ?? ''}`);
     else positional.push(m[8]!);
   }
