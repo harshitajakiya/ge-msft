@@ -36,6 +36,7 @@ import {
 } from './capture.js';
 import { commentAdded, deriveOrigin, documentChanged, selectionChanged } from './events.js';
 import {
+  chartAreas,
   formatSourceComment,
   planAddComment,
   planConditional,
@@ -44,6 +45,7 @@ import {
   planInsertChart,
   planWriteCells,
   splitFormulaGrid,
+  type ChartArea,
 } from './actuate-plan.js';
 import { provenanceRecord } from './provenance-record.js';
 
@@ -773,19 +775,46 @@ export class ExcelBridge implements DocBridge {
         },
       };
     }
+    const split = chartAreas(plan.address);
+    if ('error' in split) {
+      return {
+        ok: false,
+        changeId: req.changeId,
+        kind: req.kind,
+        error: { code: 'invalid_target', message: split.error },
+      };
+    }
+    // Non-adjacent columns (categories + values) need the series API (ExcelApi 1.7).
+    if (split.areas.length > 1 && !isSet('ExcelApi', '1.7')) {
+      return {
+        ok: false,
+        changeId: req.changeId,
+        kind: req.kind,
+        degraded: true,
+        error: {
+          code: 'unsupported_host',
+          message: 'This host cannot chart separate ranges (ExcelApi < 1.7).',
+        },
+      };
+    }
     const result = await Excel.run(async (ctx) => {
       const { sheetName, rangeAddress } = parseAddress(plan.address as string);
       const sheet =
-        sheetName !== undefined
-          ? ctx.workbook.worksheets.getItem(sheetName)
-          : ctx.workbook.worksheets.getActiveWorksheet();
+        split.sheetName !== undefined
+          ? ctx.workbook.worksheets.getItem(split.sheetName)
+          : sheetName !== undefined && split.areas.length === 1
+            ? ctx.workbook.worksheets.getItem(sheetName)
+            : ctx.workbook.worksheets.getActiveWorksheet();
       // `charts.add(type, sourceData, seriesBy)`. The host enums are erased to strings at runtime;
       // the plan already mapped the agent enums → the `Excel.ChartType`/`ChartSeriesBy` strings.
-      const chart = sheet.charts.add(
-        plan.chartType as Excel.ChartType,
-        sheet.getRange(rangeAddress),
-        plan.seriesBy as Excel.ChartSeriesBy,
-      );
+      const chart =
+        split.areas.length === 1
+          ? sheet.charts.add(
+              plan.chartType as Excel.ChartType,
+              sheet.getRange(rangeAddress),
+              plan.seriesBy as Excel.ChartSeriesBy,
+            )
+          : await addAreaChart(ctx, sheet, plan.chartType, split.areas);
       if (plan.title !== undefined) chart.title.text = plan.title;
       // Read back the MINTED chart name for the inverse identity.
       chart.load('name');
@@ -1208,6 +1237,52 @@ function resolveReadRange(ctx: Excel.RequestContext, selector: string): Excel.Ra
 }
 
 /** Split "Sheet1!A1:B3" into its worksheet name and range address. */
+/**
+ * A chart over separate areas: the first is the categories, each later one a series. Excel takes a
+ * text first row as the series name, so each value area is charted with its header when it has
+ * one, and the categories are set without theirs.
+ */
+async function addAreaChart(
+  ctx: Excel.RequestContext,
+  sheet: Excel.Worksheet,
+  chartType: string,
+  areas: readonly ChartArea[],
+): Promise<Excel.Chart> {
+  const [categories, ...values] = areas as [ChartArea, ...ChartArea[]];
+  const firsts = values.map((area) => sheet.getRange(area.topLeft));
+  firsts.forEach((cell) => cell.load('values'));
+  await ctx.sync();
+  const header = firsts.map((cell) => {
+    const v = cell.values[0]?.[0];
+    return typeof v === 'string' && v.trim() !== '' && Number.isNaN(Number(v)) ? v : undefined;
+  });
+  const hasHeader = header.every((h) => h !== undefined);
+  const xValues = sheet.getRange(hasHeader ? categories.body : categories.address);
+  const chart = sheet.charts.add(
+    chartType as Excel.ChartType,
+    sheet.getRange(values[0]!.address),
+    'Columns' as Excel.ChartSeriesBy,
+  );
+  // Commit the chart first: Office.js batches are not transactional, and a series failure in the
+  // same batch left a chart with no recorded name, so no undo and no provenance (security review).
+  chart.load('name');
+  await ctx.sync();
+  try {
+    chart.series.getItemAt(0).setXAxisValues(xValues);
+    values.slice(1).forEach((area, i) => {
+      const series = chart.series.add(header[i + 1]);
+      series.setValues(sheet.getRange(hasHeader ? area.body : area.address));
+      series.setXAxisValues(xValues);
+    });
+    await ctx.sync();
+  } catch (error) {
+    chart.delete();
+    await ctx.sync();
+    throw error;
+  }
+  return chart;
+}
+
 export function parseAddress(address: string): { sheetName?: string; rangeAddress: string } {
   const bang = address.lastIndexOf('!');
   if (bang < 0) return { rangeAddress: address };

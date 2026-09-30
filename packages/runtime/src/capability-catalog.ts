@@ -2,6 +2,7 @@ import {
   COMMAND_HELP,
   grammarFor,
   registryEntryForKindAndSurface,
+  WRITE_VERB_TO_KIND,
   type ActuationKind,
   type CapabilityManifest,
   type CommandHelpEntry,
@@ -78,6 +79,37 @@ export function discoverCommands(manifest: CapabilityManifest, query: string): C
       limits: [...entry.failureModes, ...entry.safety].slice(0, 3).map((line) => clip(line, 180)),
       example: exampleFor(spec, entry, terms),
     }));
+}
+
+/** A grammar spec that changes the document: a core write verb or a `/<kind>` specialized command. */
+function isWriteSpec(spec: VerbSpec): boolean {
+  return Object.hasOwn(WRITE_VERB_TO_KIND, spec.verb) || spec.usage.startsWith('/');
+}
+
+/**
+ * One exact line for every write the surface advertises, in grammar order. A specialized command's
+ * usage is only `/<kind> [key=value ...]`, which names no parameter, so its registry example is
+ * shown instead. Every write is listed, not a task-ranked subset: a write the model has only seen by
+ * name gets an invented syntax (live 2026-09-30: four different `chart` forms in four identical runs).
+ */
+export function writeSignatures(manifest: CapabilityManifest): string[] {
+  return grammarFor(manifest)
+    .filter(isWriteSpec)
+    .map((spec) => (spec.usage.startsWith('/') ? signatureExample(manifest, spec) : spec.usage));
+}
+
+/**
+ * A specialized command's first registry example that is one complete line of that same command.
+ * Unlike {@link exampleFor}, a `<placeholder>` is allowed: this line is syntax, like a usage line.
+ */
+function signatureExample(manifest: CapabilityManifest, spec: VerbSpec): string {
+  const example = helpFor(manifest, spec).examples.find(
+    (value) =>
+      !value.includes('\n') &&
+      value.length <= 240 &&
+      value.replace(/^\//, '').split(/\s/, 1)[0] === spec.verb,
+  );
+  return example ?? spec.usage;
 }
 
 export function renderCommandCard(card: CommandCard): string {

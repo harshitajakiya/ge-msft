@@ -20,6 +20,7 @@ export { chunkBlocks, splitText } from './chunk.js';
 export { contextualizeChunk } from './contextualize.js';
 export {
   buildDocStateSnapshot,
+  commandRef,
   renderDocState,
   type BuildDocStateInput,
 } from './doc-state-builder.js';

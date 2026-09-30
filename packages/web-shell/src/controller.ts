@@ -26,7 +26,11 @@ import type {
 import {
   asChangeId,
   assessActuationResult,
+  CONFIRMED_PLAN_CLOSE,
+  CONFIRMED_PLAN_OPEN,
   deriveOutput,
+  editIntentFor,
+  planDescribesChange,
   extractCommandBlock,
 } from '@ge/contracts';
 import type {
@@ -373,7 +377,7 @@ function renderConfirmedPlanTask(pending: PendingCommandPlan): string {
     'Execute this user-confirmed plan in the open Microsoft 365 surface.',
     'Treat the plan as approved intent only: read live host content before any write, respect exclusions, emit only the supported cmd protocol, and let the normal preview/approval gate run.',
     '',
-    '<confirmed_plan>',
+    CONFIRMED_PLAN_OPEN,
     `original_request: ${task}`,
     `intent: ${plan.intent}`,
     `surface: ${plan.surface}`,
@@ -390,7 +394,7 @@ function renderConfirmedPlanTask(pending: PendingCommandPlan): string {
   for (const [i, step] of plan.steps.entries()) lines.push(`step ${i + 1}: ${step}`);
   for (const exclude of plan.excludes) lines.push(`exclude: ${exclude}`);
   if (plan.confidence) lines.push(`confidence: ${plan.confidence}`);
-  lines.push('</confirmed_plan>');
+  lines.push(CONFIRMED_PLAN_CLOSE);
   return lines.join('\n');
 }
 
@@ -417,6 +421,7 @@ export interface RunStep {
     | 'write-result'
     | 'no-fence'
     | 'capped'
+    | 'repair'
     | 'done'
     | 'exhausted'
     | 'code-execution'
@@ -1100,7 +1105,14 @@ export class PanelController {
         });
         return;
       }
-      if (deriveOutput(plan.intent) === 'chat') {
+      // A chat intent over steps that change the document is a mislabel, not a question: chat
+      // cannot write and has claimed writes it never made. Stage it for confirmation as an edit.
+      const edit = editIntentFor(plan.surface);
+      const staged =
+        deriveOutput(plan.intent) === 'chat' && planDescribesChange(plan) && edit
+          ? { ...plan, intent: edit }
+          : plan;
+      if (deriveOutput(staged.intent) === 'chat') {
         this.set({
           messages: this.state.messages.filter((message) => message.id !== userMsg.id),
         });
@@ -1108,7 +1120,7 @@ export class PanelController {
         return;
       }
       this.set({
-        pendingCommandPlan: { plan, task: t, ...(grounding ? { grounding } : {}) },
+        pendingCommandPlan: { plan: staged, task: t, ...(grounding ? { grounding } : {}) },
       });
     } catch (err) {
       if (this.inflight === controller && !controller.signal.aborted && !isAbortError(err))
@@ -1352,6 +1364,17 @@ export class PanelController {
       case 'capped':
         this.addStep('capped', ev.reason);
         return;
+      case 'repair': {
+        const failed = ev.errors === 1 ? '1 command' : `${ev.errors} commands`;
+        const landed = ev.alreadyApplied.length
+          ? ` Already applied: ${ev.alreadyApplied.join('; ')}.`
+          : '';
+        this.addStep(
+          'repair',
+          `Turn ${ev.turn}: ${failed} failed validation — asking the model to fix ${ev.errors === 1 ? 'it' : 'them'}; no staged write was applied.${landed}`,
+        );
+        return;
+      }
       case 'done':
         this.addStep('done', 'Done');
         return;

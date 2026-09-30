@@ -176,10 +176,17 @@ function hasActuatingIntent(allowedIntents: Iterable<Intent> | undefined): boole
   return false;
 }
 
+/** Text that reads as a question or a request for an explanation, which plain chat answers. */
+const QUESTION_RE =
+  /^\s*(?:(?:ok(?:ay)?|so|hey|hi)[\s,]+)?(?:(?:can|could|would)\s+you\s+(?:tell|explain|describe|summari[sz]e)\b|who|what|what's|when|where|which|why|how|is|are|was|were|does|did|should|summari[sz]e|explain|tell\s+me|describe|compare)\b/i;
+
 /**
- * Thin router predicate, not an intent classifier. It only decides whether arbitrary free text looks
- * action-like enough to ask the command planner. The planner owns intent selection, exclusions, and
- * clarification; the client keeps only obvious one-shot fast paths such as "create a chart".
+ * Thin router predicate, not an intent classifier. It decides only whether free text goes to the
+ * command planner or straight to chat; the planner owns intent selection, exclusions and
+ * clarification, and can still answer in chat. On a surface that can write, anything that is not
+ * a question goes to the planner. Matching a list of action verbs instead sent "In G12 put a
+ * formula…", "show me a bar chart…" and "I want a bar chart…" to chat, where nothing can be
+ * written and the model described or invented a result (docs/COMMAND-RELIABILITY.md, fix E).
  */
 export function shouldUsePlannerForFreeText(
   allowedIntents: Iterable<Intent> | undefined,
@@ -189,9 +196,13 @@ export function shouldUsePlannerForFreeText(
   const raw = inv.raw.trim();
   if (!raw || raw.startsWith('/')) return false;
   if (!hasActuatingIntent(allowedIntents)) return false;
-  return (
-    OFFICE_ACTION_REQUEST_RE.test(raw) || COMMENT_ACTION_RE.test(raw) || FIND_REPLACE_RE.test(raw)
-  );
+  if (
+    OFFICE_ACTION_REQUEST_RE.test(raw) ||
+    COMMENT_ACTION_RE.test(raw) ||
+    FIND_REPLACE_RE.test(raw)
+  )
+    return true;
+  return !(QUESTION_RE.test(raw) || raw.endsWith('?'));
 }
 
 /**

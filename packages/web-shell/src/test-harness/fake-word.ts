@@ -120,16 +120,28 @@ class FakeSearchResult {
   }
 }
 
+/** Incremented by every `ctx.sync()`; a proxy's loaded properties exist only after one. */
+let syncGeneration = 0;
+
 class FakeSearchResultCollection {
-  items: FakeSearchResult[];
+  private readonly hits: FakeSearchResult[];
+  private readonly createdAt = syncGeneration;
   constructor(seed: WordSeed, query: string, matchCase: boolean) {
     const hay = (s: string): string => (matchCase ? s : s.toLowerCase());
     const needle = matchCase ? query : query.toLowerCase();
     // One hit per paragraph that contains the query (mirrors Office's per-occurrence ranges,
     // collapsed to paragraph granularity — enough for anchor choice + drift).
-    this.items = seed.paragraphs
+    this.hits = seed.paragraphs
       .filter((p) => hay(p.text).includes(needle))
       .map(() => new FakeSearchResult(seed, query));
+  }
+  /** Like Word, `items` is unavailable until a sync: reading it first throws PropertyNotLoaded. */
+  get items(): FakeSearchResult[] {
+    if (syncGeneration === this.createdAt)
+      throw new Error(
+        "fake-word: The property 'items' is not available. Call load and context.sync() first.",
+      );
+    return this.hits;
   }
   load(_props?: string): this {
     return this;
@@ -238,6 +250,7 @@ class FakeWordContext {
     this.document = new FakeWordDocument(seed, office);
   }
   sync(): Promise<void> {
+    syncGeneration += 1;
     return Promise.resolve();
   }
 }

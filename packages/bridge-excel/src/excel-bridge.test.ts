@@ -9,6 +9,7 @@ import {
 } from '@ge/contracts';
 import type { HostEvent } from '@ge/triggers';
 import { ExcelBridge } from './excel-bridge.js';
+import { chartAreas } from './actuate-plan.js';
 
 /**
  * Self-contained, in-memory **Excel host simulator** for the bridge-excel package. It models ONLY
@@ -59,6 +60,10 @@ interface ChartSeed {
   seriesBy: string;
   sourceAddress: string;
   title?: string;
+  /** Category (X-axis) source set on series 0 via `setXAxisValues`. */
+  xAxis?: string;
+  /** Series added after `charts.add` via `series.add` + `setValues`/`setXAxisValues`. */
+  extraSeries?: Array<{ name?: string; values?: string; xAxis?: string }>;
 }
 /** One conditional-format rule appended to a range's CF collection. */
 interface CfSeed {
@@ -78,6 +83,8 @@ interface ExcelSeed {
   tables: TableSeed[];
   /** Charts minted via `charts.add`, in mint order. */
   charts: ChartSeed[];
+  /** Make the next chart-series write throw (a host failure after `charts.add`). */
+  failSeries?: boolean;
   /** Conditional-format rules per range address (ordinal = index within the array). */
   conditionalFormats: Map<string, CfSeed[]>;
   /** Monotonic counters so each mint gets a deterministic host-assigned name. */
@@ -379,11 +386,58 @@ class FakeChartTitle {
     this.target.title = v;
   }
 }
+/** Resolve a fake range's address immediately (the fake host has no deferred series writes). */
+function addressOf(range: FakeRange): string {
+  range.load('address');
+  range.flushLoads();
+  return range.address;
+}
+class FakeChartSeries {
+  constructor(
+    private readonly onSet: (key: 'values' | 'xAxis', address: string) => void,
+    private readonly fail = false,
+  ) {}
+  setValues(range: FakeRange): void {
+    if (this.fail) throw new Error('fake-excel: series write failed');
+    this.onSet('values', addressOf(range));
+  }
+  setXAxisValues(range: FakeRange): void {
+    this.onSet('xAxis', addressOf(range));
+  }
+}
+class FakeChartSeriesCollection {
+  constructor(
+    private readonly target: ChartSeed,
+    private readonly fail = false,
+  ) {}
+  getItemAt(index: number): FakeChartSeries {
+    if (index !== 0) throw new Error('fake-excel: only series 0 exists before series.add');
+    return new FakeChartSeries((key, address) => {
+      if (key === 'xAxis') this.target.xAxis = address;
+    });
+  }
+  add(name?: string): FakeChartSeries {
+    const entry: { name?: string; values?: string; xAxis?: string } = name ? { name } : {};
+    (this.target.extraSeries ??= []).push(entry);
+    return new FakeChartSeries((key, address) => {
+      entry[key] = address;
+    }, this.fail);
+  }
+}
 class FakeChart {
-  constructor(private readonly target: ChartSeed) {}
+  constructor(
+    private readonly target: ChartSeed,
+    private readonly seed?: ExcelSeed,
+  ) {}
   private loaded = false;
   get title(): FakeChartTitle {
     return new FakeChartTitle(this.target);
+  }
+  get series(): FakeChartSeriesCollection {
+    return new FakeChartSeriesCollection(this.target, this.seed?.failSeries === true);
+  }
+  delete(): void {
+    if (this.seed) this.seed.charts = this.seed.charts.filter((c) => c !== this.target);
   }
   load(props?: string): this {
     if (!props || props.includes('name')) this.loaded = true;
@@ -409,7 +463,7 @@ class FakeChartCollection {
     const name = `Chart ${++this.seed.chartCounter}`;
     const target: ChartSeed = { name, sheet: this.sheetName, chartType, seriesBy, sourceAddress };
     this.seed.charts.push(target);
-    return new FakeChart(target);
+    return new FakeChart(target, this.seed);
   }
 }
 
@@ -1707,6 +1761,95 @@ describe('ExcelBridge.actuate insert-chart (ADR-0007 chart verb)', () => {
       sourceAddress: 'Project schedule!B5:D30',
       title: 'Task Progress',
     });
+  });
+
+  it('charts non-adjacent columns: first area is the categories, the rest are series', async () => {
+    // Live 2026-09-30: for "a bar chart of Total by Product" the model emitted
+    // `chart bar Sheet2!C1:C11,Sheet2!G1:G11`, which `getRange` rejects (docs/COMMAND-RELIABILITY.md).
+    active = installExcel(salesSeed());
+    const res = await new ExcelBridge().actuate(
+      insertChart(
+        { chart: { chartType: 'bar', sourceRange: 'Sales!A1:A4,Sales!C1:C4', seriesBy: 'auto' } },
+        'chg-areas',
+      ),
+    );
+    expect(res.ok).toBe(true);
+    expect(active.seed.charts[0]).toMatchObject({
+      chartType: 'BarClustered',
+      seriesBy: 'Columns',
+      sourceAddress: 'Sales!C1:C4', // the value column, header included (becomes the series name)
+      xAxis: 'Sales!A2:A4', // the categories, without their header
+    });
+    expect(res.inverse).toEqual({ op: 'delete-object', objectType: 'chart', name: 'Chart 1' });
+  });
+
+  it('adds a series for each further value area', async () => {
+    active = installExcel(salesSeed());
+    const res = await new ExcelBridge().actuate(
+      insertChart(
+        {
+          chart: {
+            chartType: 'column',
+            sourceRange: 'Sales!A1:A4,Sales!B1:B4,Sales!C1:C4',
+            seriesBy: 'auto',
+          },
+        },
+        'chg-areas-3',
+      ),
+    );
+    expect(res.ok).toBe(true);
+    const chart = active.seed.charts[0]!;
+    expect(chart.sourceAddress).toBe('Sales!B1:B4');
+    expect(chart.extraSeries).toEqual([
+      { values: 'Sales!C2:C4', xAxis: 'Sales!A2:A4', name: expect.any(String) },
+    ]);
+  });
+
+  it('removes a multi-area chart whose series step fails, leaving no orphan', async () => {
+    const seed = salesSeed();
+    seed.failSeries = true;
+    active = installExcel(seed);
+    await expect(
+      new ExcelBridge().actuate(
+        insertChart(
+          {
+            chart: {
+              chartType: 'column',
+              sourceRange: 'Sales!A1:A4,Sales!B1:B4,Sales!C1:C4',
+              seriesBy: 'auto',
+            },
+          },
+          'chg-areas-fail',
+        ),
+      ),
+    ).rejects.toThrow('series write failed');
+    expect(seed.charts).toHaveLength(0);
+  });
+
+  it('keeps a defined name as one source instead of reading cell addresses out of it', () => {
+    // Security review: `FY24_Q3` was scanned as the areas FY24 and Q3.
+    expect(chartAreas('FY24_Q3')).toEqual({
+      areas: [{ address: 'FY24_Q3', body: 'FY24_Q3', topLeft: 'FY24_Q3' }],
+    });
+    expect(chartAreas('Revenue')).toMatchObject({ areas: [{ address: 'Revenue' }] });
+    expect(chartAreas("'Sales, 2024'!A1:A4,'Sales, 2024'!C1:C4")).toMatchObject({
+      sheetName: 'Sales, 2024',
+      areas: [{ address: 'A1:A4' }, { address: 'C1:C4' }],
+    });
+    expect(chartAreas('Sheet2!C1:C11,junk')).toEqual({ error: 'not an A1 range: junk' });
+  });
+
+  it('refuses areas on different worksheets', async () => {
+    active = installExcel(salesSeed());
+    const res = await new ExcelBridge().actuate(
+      insertChart(
+        { chart: { chartType: 'bar', sourceRange: 'Sales!A1:A4,Other!C1:C4', seriesBy: 'auto' } },
+        'chg-areas-x',
+      ),
+    );
+    expect(res.ok).toBe(false);
+    expect(res.error?.code).toBe('invalid_target');
+    expect(active.seed.charts).toHaveLength(0);
   });
 
   it('maps each agent chart type to its Excel.ChartType', async () => {

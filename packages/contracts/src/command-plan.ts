@@ -7,6 +7,8 @@ import {
   type CommandScope,
 } from './intent.js';
 import { SurfaceSchema, type Surface } from './context.js';
+import { VERBS_BY_SURFACE } from './command-palette.js';
+import { INTENT_REQUIRES } from './intent-capability.js';
 
 /**
  * The planner block (ADR-0004 — the `m365-command-planner` skill). The planner turns free text into
@@ -192,6 +194,72 @@ export function parseGround(raw: string): PlanGround {
     return { kind: bare as PlanGround['kind'] };
   }
   return { kind: 'document', ref: trimmed };
+}
+
+/**
+ * What each intent does to the document, stated by effect. Without this the planner read `rewrite`
+ * as "reword text" and labelled "In G12 put a formula…" as `ask`, which routed it to chat, where
+ * nothing can be written (docs/COMMAND-RELIABILITY.md, fix G).
+ */
+const INTENT_EFFECT: Record<Intent, string> = {
+  ask: 'answer a question; changes nothing',
+  summarize: 'summarize content; changes nothing',
+  explain: 'explain content; changes nothing',
+  rewrite:
+    'change existing content: text, values, formulas, formatting, styles, tables, links, find/replace',
+  review: 'add or reply to comments, flag issues',
+  visualize: 'create a chart',
+  draft:
+    'create or change content: slides, shapes, text boxes, slide text and formatting, pages, email replies, drafts, subject, body, recipients, attachments',
+  notes: 'post a message or card to the channel',
+};
+
+/** Verbs that describe a change to the document when they appear in a plan step. */
+const CHANGE_STEP =
+  /\b(?:add|insert|put|place|set|write|enter|fill|populate|create|make|apply|replace|change|update|edit|rewrite|format|highlight|bold|colou?r|delete|remove|move|rename|convert|turn|chart|plot|comment|reply|resolve|attach|draft|compose|sort|filter|merge|resize)\b/i;
+
+/**
+ * True when a plan whose intent answers in chat nevertheless describes a change in its steps. The
+ * planner's intent label is a model choice; its steps are the stated work. A chat intent over change
+ * steps must not be answered by chat, which cannot write and has claimed writes it never made.
+ */
+export function planDescribesChange(plan: Pick<CommandPlan, 'steps'>): boolean {
+  return plan.steps.some((step) => CHANGE_STEP.test(step));
+}
+
+/** The intent that carries general edits on a surface (`rewrite` where offered, else `draft`, …). */
+export function editIntentFor(surface: Surface): Intent | undefined {
+  // The planner's `surface` is model output; an unknown value has no edit intent.
+  const verbs: readonly Intent[] = VERBS_BY_SURFACE[surface] ?? [];
+  return (
+    (['rewrite', 'draft', 'notes'] as const).find((intent) => verbs.includes(intent)) ??
+    verbs.find((intent) => INTENT_REQUIRES[intent].length > 0)
+  );
+}
+
+/** Delimiters of the executor task a user-confirmed plan is handed off as. */
+export const CONFIRMED_PLAN_OPEN = '<confirmed_plan>';
+export const CONFIRMED_PLAN_CLOSE = '</confirmed_plan>';
+
+const CONFIRMED_PLAN_INTENT_LINE = /^(?:original_request|step\s+\d+|exclude):\s*(.*)$/i;
+
+/**
+ * The part of an executor task that states what the user wants. A confirmed-plan task wraps the
+ * request in fixed protocol instructions ("read live host content…", "the open Microsoft 365
+ * surface"); ranking commands on those words made `read`/`open` outrank `chart` on every planned
+ * task. For such a task this returns only its request, steps and exclusions; any other task is
+ * returned unchanged.
+ */
+export function commandIntentText(task: string): string {
+  const open = task.indexOf(CONFIRMED_PLAN_OPEN);
+  const close = task.indexOf(CONFIRMED_PLAN_CLOSE, open);
+  if (open < 0 || close < 0) return task;
+  return task
+    .slice(open + CONFIRMED_PLAN_OPEN.length, close)
+    .split(/\r?\n/)
+    .map((line) => CONFIRMED_PLAN_INTENT_LINE.exec(line.trim())?.[1]?.trim())
+    .filter((line): line is string => Boolean(line))
+    .join('\n');
 }
 
 const _FENCE = /```plan[^\S\n]*\r?\n([\s\S]*?)```/i;
@@ -425,6 +493,11 @@ export function renderPlanPrompt(surface: Surface, verbs?: readonly Intent[]): s
     'clarify  <a question>      # repeatable; emit when something material is ambiguous, and STOP short of guessing',
     'confidence <high|medium|low>   # optional',
     '```',
+    'Intents by effect (pick the one that matches what the request changes):',
+    ...(verbs && verbs.length > 0 ? verbs : IntentSchema.options).map(
+      (intent) => `  ${intent.padEnd(9)} ${INTENT_EFFECT[intent]}`,
+    ),
+    'A request that changes the document never uses ask, summarize or explain.',
     'Classify arbitrary text into capability-shaped steps. Infer intent, scope, context hints, then ' +
       'phrase each step in the active surface vocabulary without emitting commands.',
     'Surface vocabulary: Word tracked rewrite/comment/style/table/hyperlink/content-control; ' +
@@ -436,5 +509,9 @@ export function renderPlanPrompt(surface: Surface, verbs?: readonly Intent[]): s
     'Rules: one ```plan block only; phrase steps as intentions (not ```cmd commands); context is ' +
       'only a context-construction hint and never grants upload/code/write authority; if anything ' +
       'material is ambiguous, emit clarify line(s) instead of over-specifying.',
+    'The document snapshot is partial: it lists structure (headings, tables, slides, the selection), ' +
+      'not every line. A target the request names or quotes that is absent from the snapshot is not ' +
+      'ambiguous; plan a step that locates it, because the executor can read and search the whole ' +
+      'document. Clarify only when the request itself leaves the target, value or destination open.',
   ].join('\n');
 }

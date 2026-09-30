@@ -127,6 +127,21 @@ describe('planning — dependency DAG (ADR-0008 §7)', () => {
     expect(skipped.sort()).toEqual(['e2', 'e3']); // table+chart skipped; the independent format (e4) is not
   });
 
+  it('makes a multi-area chart depend on a write into any of its areas', () => {
+    // Security review L8: `Sheet2!C1:C11,Sheet2!G1:G11` did not parse, so the chart had no dependency.
+    const plan = analyseEffectDependencies([
+      req('write-cells', { target: { range: 'Sheet2!G2' }, cells: [['1']] }, 'c1'),
+      req(
+        'insert-chart',
+        {
+          chart: { chartType: 'bar', sourceRange: 'Sheet2!C1:C11,Sheet2!G1:G11', seriesBy: 'auto' },
+        },
+        'c2',
+      ),
+    ]);
+    expect(plan[1]!.dependsOn).toEqual(['e1']);
+  });
+
   it('classifies approval authority + reversibility per kind', () => {
     const plan = analyseEffectDependencies([
       req('write-cells', { target: { range: 'A1' }, cells: [['x']] }, 'c1'),

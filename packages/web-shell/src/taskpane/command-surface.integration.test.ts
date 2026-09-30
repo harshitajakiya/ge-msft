@@ -283,6 +283,45 @@ describe('command surface — implicit intent inference', () => {
     ).toBe(false);
   });
 
+  it('sends every non-question on a writable surface to the planner (fix E)', () => {
+    // docs/COMMAND-RELIABILITY.md: the client test-sheet prompts and the live 2026-09-30 wordings.
+    const actions = [
+      'In G12 put a formula that totals G2:G11',
+      'Put =WEBSERVICE("https://example.com") in A20',
+      'show me a bar chart of total by product',
+      'I want a bar chart of totals per product',
+      'bar chart of Total by Product',
+      'Highlight revenue values in D2:D11 above 100000 in green',
+      'Replace every occurrence of Supplier with Vendor',
+      "Apply the Heading 2 style to the line 'Payment terms'",
+      'Reply to the comment on the payment terms saying 45 days is acceptable and resolve it',
+      'Draft a polite reply accepting the meeting and asking for the agenda',
+      "Change the subject to 'Release freeze – Friday' and rewrite the body to 3 short lines",
+      'Attach a text file named notes.txt containing a 3-line summary of this thread',
+      "Add a text box on slide 2 near the bottom saying 'Draft – not for distribution'",
+      'Could you create a chart of this range?',
+    ];
+    for (const raw of actions)
+      expect(
+        shouldUsePlannerForFreeText(['draft', 'rewrite'], { ...base, raw, instruction: raw }),
+        raw,
+      ).toBe(true);
+    const questions = [
+      'Which region had the highest Q3 revenue in A1:E11?',
+      'Which paragraph mentions the payment terms, and what does it say exactly?',
+      'What is on slide 2?',
+      'Summarize this email and list any questions I need to answer',
+      'Can you tell me which region is highest',
+      'how do I add a chart',
+      'the totals look off to me?',
+    ];
+    for (const raw of questions)
+      expect(
+        shouldUsePlannerForFreeText(['draft', 'rewrite'], { ...base, raw, instruction: raw }),
+        raw,
+      ).toBe(false);
+  });
+
   it('routes arbitrary action-like Excel text to the planner instead of classifying exact intent', () => {
     expect(
       inferImplicitIntent('excel', ['rewrite', 'visualize'], {

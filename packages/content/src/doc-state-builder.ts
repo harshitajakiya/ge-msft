@@ -46,6 +46,9 @@ const RENDER_FIELD_CHARS = 240;
  */
 const SELECTION_PREVIEW_CHARS = 2000;
 
+/** A table's header row is its column list; allow a wide sheet's header before eliding. */
+const INVENTORY_TITLE_CHARS = 480;
+
 /** Code-point-safe truncation (never splits a surrogate pair mid-character). */
 function clip(text: string, n: number): string {
   const cps = Array.from(text);
@@ -110,12 +113,42 @@ function headingAnchor(block: Block): Anchor {
   return anchor;
 }
 
-/** Map a table block to a one-line dimension summary, when native structure is present. */
+/**
+ * Map a table block to a one-line dimension summary, when native structure is present. Native
+ * tables keep the header in `columns` and only data in `rows`, so the header row is named
+ * explicitly: "10 rows" alone was read as "rows 1–10" and the model dropped the last data row.
+ */
 function tableSummary(block: Block): string | undefined {
   if (block.data === undefined) return undefined;
   const cols = block.data.columns.length;
   const rows = block.data.rows.length;
-  return `${rows} row${rows === 1 ? '' : 's'} × ${cols} col${cols === 1 ? '' : 's'}`;
+  return `header row + ${rows} data row${rows === 1 ? '' : 's'}, ${cols} col${cols === 1 ? '' : 's'}`;
+}
+
+/**
+ * A table's inventory label: its full header row when native structure is present, so the model
+ * can see every column it may chart or query (a 64-char clip hid columns like `Total`), else the
+ * first text line. Rendering still escapes and caps it.
+ */
+function tableTitle(block: Block, count: number): string {
+  const header = block.data?.columns.map((c) => oneLine(String(c))).filter(Boolean);
+  // One code point past the render cap, so rendering elides a wider header with `…` instead of
+  // silently hiding its last columns.
+  if (header?.length) return clip(header.join(' | '), INVENTORY_TITLE_CHARS + 1);
+  return clip(block.text.split('\n')[0] ?? '', ANCHOR_PREFIX_CHARS) || `Table ${count}`;
+}
+
+/** Ids this builder invents for blocks without a host locator; no command can address them. */
+const SYNTHETIC_ID = /^(?:heading|table):\d+$/;
+
+/**
+ * The target a command should name for an inventory entry, or `undefined` when the entry has no
+ * host locator. Excel ranges are addressed by their bare A1 address (`read Sheet2!A1:J11`); every
+ * other host locator (`slide:<id>`, `cc:<id>`, …) is used verbatim.
+ */
+export function commandRef(id: string): string | undefined {
+  if (SYNTHETIC_ID.test(id)) return undefined;
+  return id.startsWith('range:') ? id.slice('range:'.length) : id;
 }
 
 export function buildDocStateSnapshot(input: BuildDocStateInput): DocStateSnapshot {
@@ -148,7 +181,7 @@ export function buildDocStateSnapshot(input: BuildDocStateInput): DocStateSnapsh
       const inv: DocStateInventoryEntry = {
         kind: 'table',
         id,
-        title: clip(block.text.split('\n')[0] ?? '', ANCHOR_PREFIX_CHARS) || `Table ${tableCount}`,
+        title: tableTitle(block, tableCount),
       };
       const summary = tableSummary(block);
       if (summary !== undefined) inv.summary = summary;
@@ -230,7 +263,10 @@ export function renderDocState(snapshot: DocStateSnapshot): string {
     lines.push('inventory:');
     for (const i of snapshot.inventory) {
       const summary = i.summary !== undefined ? ` (${safe(i.summary)})` : '';
-      lines.push(`  - [${i.kind}] "${safe(i.title)}"${summary}`);
+      // `ref` is host-derived (sheet names are user text), so it is escaped and quoted like a title.
+      const ref = commandRef(i.id);
+      const target = ref !== undefined ? ` ref="${safe(ref)}"` : '';
+      lines.push(`  - [${i.kind}]${target} "${safe(i.title, INVENTORY_TITLE_CHARS)}"${summary}`);
     }
   }
 

@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { ReactNode } from 'react';
 import type { ChatMessage } from '../../controller.js';
-import type { SourceRef, Surface } from '@ge/contracts';
+import { CONFIRMED_PLAN_OPEN, type SourceRef, type Surface } from '@ge/contracts';
 import type { InsertableArtifact } from '../insert-artifact.js';
 import { canRenderHostLocation } from '../../host-location.js';
 
@@ -362,7 +362,7 @@ function commandSegment(raw: string): UserCommandSegment | undefined {
 }
 
 function internalPlanSegment(text: string): InternalPlanSegment | undefined {
-  if (!text.includes('<confirmed_plan>')) return undefined;
+  if (!text.includes(CONFIRMED_PLAN_OPEN)) return undefined;
   const lines = text.replace(/\r\n/g, '\n').split('\n');
   const value = (key: string): string | undefined => {
     const prefix = `${key}:`;

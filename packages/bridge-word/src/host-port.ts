@@ -399,18 +399,20 @@ export class OfficeWordHost implements WordHost {
     if (!q) return [];
     try {
       return await Word.run(async (ctx) => {
-        const results = ctx.document.body.search(q, { matchCase });
+        // `^` starts a Word special code (`^?`, `^#` match any character or digit); search literally.
+        const results = ctx.document.body.search(q.replace(/\^/g, '^^'), { matchCase });
         // Load the match text plus its surrounding paragraph (the short contextHint). `body.search`
         // → WordApi 1.1; reading a result's `paragraphs` is broadly available, but we guard the
         // whole batch in try/catch so an older/quirky host degrades to `[]` rather than throwing.
         results.load('items/text');
         await ctx.sync();
-        const live = await withoutTrackedDeletions(ctx, results.items);
+        // Bound the hits before loading a paragraph for each: a common word can match thousands.
+        const live = (await withoutTrackedDeletions(ctx, results.items)).slice(0, MAX_SEARCH_HITS);
         const paras = live.map((r) => r.paragraphs.getFirstOrNullObject());
         for (const p of paras) p.load('text');
         await ctx.sync();
 
-        return live.slice(0, MAX_SEARCH_HITS).map((r, i) => {
+        return live.map((r, i) => {
           const para = paras[i];
           const paraText = para && !para.isNullObject ? para.text : undefined;
           const hint =

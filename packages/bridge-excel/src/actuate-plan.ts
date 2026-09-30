@@ -241,6 +241,70 @@ export function planInsertChart(req: ActuationRequest): InsertChartPlan {
   };
 }
 
+/** One area of a chart source: its full address, the address without its first row, its first cell. */
+export interface ChartArea {
+  address: string;
+  body: string;
+  topLeft: string;
+}
+
+/**
+ * Split a chart source into its A1 areas (`Sheet2!C1:C11,Sheet2!G1:G11`). The model asks for this
+ * shape to chart non-adjacent columns (categories + values), and `Worksheet.getRange` rejects it, so
+ * the bridge builds the chart from the areas instead. All areas must be on one sheet.
+ */
+export function chartAreas(
+  address: string,
+): { sheetName?: string; areas: ChartArea[] } | { error: string } {
+  const pieces = splitAreaList(address);
+  // A lone defined name (`Revenue`, `FY24_Q3`) is one source Excel resolves itself; scanning it for
+  // cell addresses read `FY24_Q3` as the areas FY24 and Q3 (security review, 2026-09-30).
+  if (pieces.length === 1 && !A1_AREA_RE.test(pieces[0]!) && DEFINED_NAME_RE.test(pieces[0]!))
+    return { areas: [{ address: pieces[0]!, body: pieces[0]!, topLeft: pieces[0]! }] };
+  const areas: ChartArea[] = [];
+  let sheetName: string | undefined;
+  for (const piece of pieces) {
+    const m = A1_AREA_RE.exec(piece);
+    if (!m) return { error: `not an A1 range: ${piece}` };
+    const sheet = m[1] === undefined ? undefined : m[1].replace(/^'|'$/g, '').replace(/''/g, "'");
+    if (areas.length > 0 && sheet !== sheetName)
+      return { error: 'chart areas must all be on one worksheet' };
+    sheetName = sheet;
+    const firstCol = m[2]!;
+    const firstRow = Number(m[3]);
+    const lastCol = m[4] ?? firstCol;
+    const lastRow = m[5] === undefined ? firstRow : Number(m[5]);
+    areas.push({
+      address: `${firstCol}${firstRow}:${lastCol}${lastRow}`,
+      body: `${firstCol}${Math.min(firstRow + 1, lastRow)}:${lastCol}${lastRow}`,
+      topLeft: `${firstCol}${firstRow}`,
+    });
+  }
+  if (areas.length === 0) return { error: `not an A1 range: ${address}` };
+  return { ...(sheetName !== undefined ? { sheetName } : {}), areas };
+}
+
+/** One whole A1 area, optionally sheet-qualified; anchored so nothing is left over. */
+const A1_AREA_RE =
+  /^(?:('(?:[^']|'')+'|[^!,\s']+)!)?\$?([A-Za-z]{1,3})\$?(\d{1,7})(?::\$?([A-Za-z]{1,3})\$?(\d{1,7}))?$/;
+const DEFINED_NAME_RE = /^[A-Za-z_\\][A-Za-z0-9_.]*$/;
+
+/** Split `A!C1:C9, 'Sales, 2024'!G1:G9` on commas outside quoted sheet names. */
+function splitAreaList(address: string): string[] {
+  const out: string[] = [];
+  let current = '';
+  let quoted = false;
+  for (const ch of address) {
+    if (ch === "'") quoted = !quoted;
+    if (ch === ',' && !quoted) {
+      out.push(current.trim());
+      current = '';
+    } else current += ch;
+  }
+  out.push(current.trim());
+  return out.filter(Boolean);
+}
+
 const CF_OPERATOR: Record<'gt' | 'lt' | 'ge' | 'le' | 'eq' | 'ne' | 'between', string> = {
   gt: 'GreaterThan',
   lt: 'LessThan',

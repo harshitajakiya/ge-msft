@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
+  commandIntentText,
+  editIntentFor,
+  planDescribesChange,
+  CONFIRMED_PLAN_CLOSE,
+  CONFIRMED_PLAN_OPEN,
   CommandPlanSchema,
   derivePlanContextStrategy,
   describePlanContextHints,
@@ -232,5 +237,61 @@ describe('renderPlanPrompt', () => {
     expect(prompt).toContain('intent   <ask | draft>');
     expect(prompt).toContain('capability-shaped steps');
     expect(prompt).toContain('one rectangular grid/table materialization step');
+  });
+});
+
+describe('commandIntentText', () => {
+  it('keeps only the request, steps and exclusions of a confirmed-plan task', () => {
+    const task = [
+      'Execute this user-confirmed plan in the open Microsoft 365 surface.',
+      'Treat the plan as approved intent only: read live host content before any write.',
+      '',
+      CONFIRMED_PLAN_OPEN,
+      'original_request: Change the title on slide 1',
+      'intent: draft',
+      'surface: powerpoint',
+      'step 1: set the title shape text',
+      'exclude: other slides',
+      'confidence: high',
+      CONFIRMED_PLAN_CLOSE,
+    ].join('\n');
+    expect(commandIntentText(task)).toBe(
+      'Change the title on slide 1\nset the title shape text\nother slides',
+    );
+  });
+
+  it('returns any other task unchanged', () => {
+    expect(commandIntentText('reply to the email accepting the meeting')).toBe(
+      'reply to the email accepting the meeting',
+    );
+    expect(commandIntentText(`${CONFIRMED_PLAN_OPEN} unterminated`)).toBe(
+      `${CONFIRMED_PLAN_OPEN} unterminated`,
+    );
+  });
+});
+
+describe('intent effects (fix G)', () => {
+  it('describes only the offered intents by their effect', () => {
+    const prompt = renderPlanPrompt('excel', ['ask', 'rewrite', 'visualize']);
+    expect(prompt).toContain('rewrite   change existing content: text, values, formulas');
+    expect(prompt).toContain(
+      'A request that changes the document never uses ask, summarize or explain.',
+    );
+    expect(prompt).not.toContain('draft     create or change content');
+  });
+
+  it('recognises change steps and the edit intent of each surface', () => {
+    expect(planDescribesChange({ steps: ['add excel formula in G12 to sum range G2:G11'] })).toBe(
+      true,
+    );
+    expect(planDescribesChange({ steps: ['identify the region with the highest total'] })).toBe(
+      false,
+    );
+    expect(editIntentFor('excel')).toBe('rewrite');
+    expect(editIntentFor('word')).toBe('rewrite');
+    expect(editIntentFor('powerpoint')).toBe('draft');
+    expect(editIntentFor('outlook')).toBe('draft');
+    expect(editIntentFor('teams')).toBe('notes');
+    expect(editIntentFor('not-a-surface' as never)).toBeUndefined();
   });
 });

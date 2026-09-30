@@ -50,6 +50,22 @@ function parseRange(ref: string): ParsedRange | undefined {
   };
 }
 
+/** Split a comma-separated area list on commas outside quoted sheet names. */
+function splitAreas(address: string): string[] {
+  const out: string[] = [];
+  let current = '';
+  let quoted = false;
+  for (const ch of address) {
+    if (ch === "'") quoted = !quoted;
+    if (ch === ',' && !quoted) {
+      out.push(current.trim());
+      current = '';
+    } else current += ch;
+  }
+  out.push(current.trim());
+  return out.filter(Boolean);
+}
+
 /** Expand a grid origin cell by an R×C body (the spill region) so dependents can overlap it. */
 function expandGrid(origin: ParsedRange, rows: number, cols: number): ParsedRange {
   if (rows <= 0 || cols <= 0) return origin;
@@ -107,8 +123,11 @@ export function effectResources(req: ActuationRequest): {
         writes: [obj(`table:${p.table?.name ?? p.table?.range ?? req.changeId}`)],
       };
     case 'insert-chart':
+      // A multi-area source (`Sheet2!C1:C11,Sheet2!G1:G11`) depends on each of its areas.
       return {
-        reads: p.chart?.sourceRange ? [range(p.chart.sourceRange)] : [],
+        reads: p.chart?.sourceRange
+          ? splitAreas(p.chart.sourceRange).map((area) => range(area))
+          : [],
         writes: [obj(`chart:${p.chart?.sourceRange ?? req.changeId}`)],
       };
     case 'format-conditional':

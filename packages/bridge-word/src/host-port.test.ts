@@ -142,9 +142,18 @@ function install(opts: InstallOpts = {}): { rec: Recorder; restore: () => void }
   }
 
   class FakeResultCollection {
-    items: FakeResult[];
+    private readonly hits: FakeResult[];
+    private readonly createdAt = rec.syncCount;
     constructor(query: string) {
-      this.items = (opts.searchHits?.[query] ?? []).map((t) => new FakeResult(t));
+      this.hits = (opts.searchHits?.[query] ?? []).map((t) => new FakeResult(t));
+    }
+    /** Like Word, `items` is unavailable until a sync: reading it first throws PropertyNotLoaded. */
+    get items(): FakeResult[] {
+      if (rec.syncCount === this.createdAt)
+        throw new Error(
+          "fake-word: The property 'items' is not available. Call load and context.sync() first.",
+        );
+      return this.hits;
     }
     load(p?: string): this {
       rec.trace.push(`results.load:${p ?? ''}`);

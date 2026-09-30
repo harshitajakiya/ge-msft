@@ -5,6 +5,13 @@ import { ContextKindSchema, SurfaceSchema, type Surface } from './context.js';
 import { SourceRefSchema } from './finding.js';
 import { ProvenancePayloadSchema } from './provenance.js';
 
+/** One A1 area, optionally sheet-qualified (`Sheet2!A1:J11`, `'Q3 Sales'!$B$2`). */
+const A1_AREA = String.raw`(?:(?:'[^']+'|[^!,\s'"{}\[\]]+)!)?\$?[A-Za-z]{1,3}\$?\d{1,7}(?::\$?[A-Za-z]{1,3}\$?\d{1,7})?`;
+/** A chart source: comma-separated A1 areas, or a defined name. */
+export const CHART_SOURCE_PATTERN = new RegExp(
+  String.raw`^(?:${A1_AREA}(?:\s*,\s*${A1_AREA})*|[A-Za-z_\\][A-Za-z0-9_.]*)$`,
+);
+
 /**
  * The capability foundation (part 2 of 2): **actuation**.
  *
@@ -199,11 +206,21 @@ export const ActuationParamsSchema = z.object({
       name: z.string().optional(), // table name; the bridge mints one if absent
     })
     .optional(),
-  /** insert-chart (ADR-0007): a chart over `sourceRange`. */
+  /**
+   * insert-chart (ADR-0007): a chart over `sourceRange`, one or more comma-separated A1 areas on one
+   * sheet (`Sheet2!C1:C11,Sheet2!G1:G11`: the first area is the categories) or a defined name. Any
+   * other text is refused at dry-run, before approval: a model once passed a JSON object here, which
+   * reached the approval card and only failed inside Excel (docs/COMMAND-RELIABILITY.md, fix C).
+   */
   chart: z
     .object({
       chartType: z.enum(['column', 'bar', 'line', 'pie', 'scatter', 'area']),
-      sourceRange: z.string(),
+      sourceRange: z
+        .string()
+        .regex(
+          CHART_SOURCE_PATTERN,
+          'chart range must be A1 areas on one sheet (Sheet1!A1:B9 or Sheet1!C1:C9,Sheet1!G1:G9) or a defined name',
+        ),
       seriesBy: z.enum(['rows', 'columns', 'auto']).default('auto'),
       title: z.string().optional(),
     })
