@@ -489,7 +489,7 @@ export const COMMAND_HELP = {
   chart: {
     command: 'chart',
     useWhen:
-      'you need to create an Office-native Excel chart from a verified range or derived summary table',
+      'you need an Excel chart; chart only the label column and its value column(s), listing separate areas for non-adjacent columns (C1:C11,G1:G11), never a whole multi-column table',
     syntax: 'chart <column|bar|line|pie|scatter|area> <range> [title="..."] [series=rows|columns]',
     discovery: [
       'read <source-range>',
@@ -504,6 +504,7 @@ export const COMMAND_HELP = {
       'Preview chart type, range, title, and series orientation, then wait for approval.',
     ],
     examples: [
+      'chart bar Sheet2!C1:C11,Sheet2!G1:G11 title="Total by product"',
       'chart column Report!A1:B11 title="Top regions"',
       'chart bar \'Daily schedule\'!K6:L18 title="Weekly Hours by Activity" series=columns',
     ],

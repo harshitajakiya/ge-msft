@@ -236,6 +236,50 @@ handling), `runtime/src/command-protocol.ts`. Tests:
 `bridge-word/src/host-port.test.ts`, `web-shell/src/test-harness/fake-word.ts`,
 `bridge-excel/src/capture.test.ts`.
 
+### Sign-in stopped working until the cached id token expired
+
+- **Every request failed with `WIF token exchange failed (400): invalid_grant … ID Token issued at …
+  is stale to sign-in`.** Google's STS refuses an Entra id token issued too long before the
+  exchange, even when it has not expired. MSAL's silent acquire kept serving that cached token, so
+  every task failed until sign-in, and reloading the task pane did not help (live 2026-10-01).
+- **On that error the exchange now asks MSAL for a newly issued token (`forceRefresh`) and retries
+  once.** Live, the next exchange returned 400 and the retry 200. Other 400s are not retried. A failed
+  exchange is a typed HTTP 4xx error, so outer retry policies do not repeat it. The client still
+  holds only the user's own tokens, in memory; a security review of this change found nothing above
+  low severity, and its low findings are fixed.
+
+Code: `gemini-client/src/wif.ts` (`exchange`, `WifExchangeError`), `web-shell/src/auth-client.ts`
+(`getIdToken({ forceRefresh })`). Tests: `gemini-client/src/wif.test.ts`,
+`web-shell/src/auth-client.test.ts`.
+
+### Host and navigation fixes found by the cross-surface run
+
+- **The PowerPoint task pane stayed blank at start-up.** Boot awaited `Office.auth.getAuthContext()`
+  for an optional login hint, and on PowerPoint for the web that call never settles (Word answers at
+  once). Boot now waits at most 2 seconds and continues without the hint; the pane then mounted in
+  about 6 seconds. Code: `web-shell/src/taskpane/office-login-hint.ts`.
+- **Word OOXML inserts always failed.** The model writes a bare `<w:p>…</w:p>` fragment, and
+  `insertOoxml` requires a flat OPC package, so every insert ended `outcome_unknown`. A fragment is
+  now wrapped in the minimal package; a full package passes through. Code:
+  `bridge-word/src/actuate-plan.ts` (`toOoxmlPackage`).
+- **On a long Word document the model could find a heading but not the text under it.** A search
+  hit now carries up to two following paragraphs (capped at 600 characters; the hit's own paragraph
+  is kept whole). Code: `bridge-word/src/host-port.ts` (`followingText`).
+- **A chart over "A1:J11" plotted every column.** Asked for "a column chart of Total by Product from
+  A1:J11", the model charted the whole table. The `chart` help card now says to chart only the
+  label and value columns, listing separate areas for non-adjacent columns, with that as its first
+  example. The skill manifest was regenerated with `bun run emit:language` to keep the drift gate
+  green.
+
+### Regression check against the fixes already on `merged-ge-fixes`
+
+A review of every behaviour introduced by `571685e`, `24a4e81`, `0a1aeb4`, `bb111c0`, `c6cba57`,
+`32b2482` and `8402bb4` found one regression, now fixed: the duplicate-write refusal from
+`24a4e81` ("already applied … do not repeat it") was counted as a failed line by fix D, so a program
+that repeated a landed write lost its other writes and could end `repair_exhausted`. It is now an
+advisory, and two replay tests fail without the fix. Everything else was preserved; the PowerPoint
+and Outlook bridges are untouched. All 612 tests in the 14 test files those commits touched pass.
+
 ### E — a chat turn carries the document data the question needs
 
 - **Every bridge's search matched the whole question as one substring, so chat read nothing.**
@@ -291,7 +335,7 @@ test reproduces the recorded ranking failure on the raw task (`read`, `open`) an
 wins on the user's request.
 
 **Definition of done.** On `fix/command-reliability-v2` (based on `merged-ge-fixes`):
-`bun run typecheck` clean; `bun run test` 2,814 passed, 16 skipped, 0 failed; `bun run lint`
+`bun run typecheck` clean; `bun run test` 2,829 passed, 16 skipped, 0 failed; `bun run lint`
 clean; Python parity checks pass (71 golden cases).
 
 **Security review.** The `security-reviewer` agent found no critical or high issues. It confirmed
@@ -337,26 +381,53 @@ problems the review had predicted: r2 and r4 ran all 12 turns, a surviving `$dat
 collided with the corrected program, and the same analyze-input mistake was repeated 10 times.
 All three are fixed above.
 
-**Cross-surface run (Excel and Word, each prompt 3 times, every result checked in the document).**
-The client-sheet prompts, adapted to the test data, on the build with fixes A–G. Every approval card
-was approved.
+**Cross-surface run on the final build.** The client test-sheet prompts, each run 3 times unless
+noted, every approval card approved, and every result checked in the document itself (cells,
+charts, paragraphs, comments, slides), not in the chat text.
+
+**PowerPoint: 21 of 21.**
+
+| Case | Result |
+| --- | --- |
+| What is on slide 2? | 3/3 |
+| Draft one slide titled Q4 outlook with 3 bullets | 3/3 |
+| Create a 4-slide deck (problem, options, recommendation, next steps) | 3/3 |
+| Change the title on slide 1 to 'FY26 Plan' | 3/3 |
+| Add a text box on slide 2 near the bottom | 3/3 |
+| Make the title shape on slide 1 blue with white text | 3/3 |
+| Add a slide with a table of 3 risks and their owners | 3/3 |
+
+**Excel: 8 of 10 cases fully correct.**
 
 | Case | Result | Note |
 | --- | --- | --- |
-| Excel: which region had the highest total | 3/3 | answered from read cell data |
-| Excel: formula in G12 | 3/3 | routed to chat 3 of 3 before fix E |
-| Excel: table in L1:M4 · WEBSERVICE blocked · format · native table | 3/3 each | guardrail refused the formula after approval |
-| Excel: conditional format | 2/2 | 1 run unverified (harness read error) |
-| Excel: titled column chart · bar chart | 2/3 · 1/3 | failures are the two-area range and analyze guessing; fixed afterwards, not re-run |
-| Excel: comment on the lowest total | 1/3 | numeric read crash and computed addresses; fixed afterwards, not re-run |
-| Word: which paragraph mentions payment terms | 3/3 | 0/3 before the search fix |
-| Word: comments, reply/resolve | 1/3 · 0/3 | this branch then lacked `571685e` (comment reply) and the whole-document read fix |
-| Word: selection rewrite / replace | not valid | the harness selected the wrong paragraph (fixed); re-run pending |
+| Which region had the highest total revenue | 3/3 | answered from read cell data |
+| In G12 put a formula that totals G2:G11 | 3/3 | went to chat 3 of 3 before fix E |
+| Write a small table in L1:M4 | 3/3 | |
+| Put =WEBSERVICE(…) in A20 | 3/3 | refused after approval |
+| Row 1 bold with grey fill, F2:G11 as currency | 2/3 | the model left out the fill once |
+| Turn A1:J11 into a table | 3/3 | |
+| Column chart of Total by Product **from A1:J11** | 0/3 correct | the model charted all of A1:J11; the chart help card was changed after this run, not re-run |
+| Bar chart of Total by Product | 3/3 correct data | one came out as a column chart |
+| Highlight Total above 100000 in green | 3/3 | |
+| Comment on the lowest Total | 2/3 | one response blocked by the tenant content policy |
 
-PowerPoint did not run: its task pane stopped loading during this pass. Outlook cannot load the
-add-in in this tenant; its fixes are covered by `web-shell/src/taskpane/outlook-reliability.integration.test.ts`.
-This change is based on `merged-ge-fixes`, which carries `571685e`, `24a4e81` and `0a1aeb4`; the
-Word and PowerPoint cases are to be re-run on this branch.
+**Word: 8 of 9 cases pass.**
+
+| Case | Result | Note |
+| --- | --- | --- |
+| Which paragraph mentions the payment terms | 4/4 | 0/3 before the search fix |
+| Rewrite the selected paragraph | 4/4 | |
+| Add a comment on sentences with an unclear deadline or amount | 2/2 with the search-context fix | 1/3 before |
+| Reply to the comment and resolve it | 3/4 | one planner clarification: comments are not in Word's snapshot |
+| Replace the selected sentence | 4/4 | |
+| Replace every Supplier with Vendor | 4/4 | |
+| Insert a bold OOXML heading at the cursor | 1/1 valid with the fixes | 0/5 before; a second run was invalidated by the harness selecting the wrong paragraph |
+| Apply Heading 2 to 'Payment terms' | 4/4 | |
+| Insert a table after the last paragraph | **open** | the model cannot target the end of the document and twice inserted into the user's own text (reverted) |
+
+**Outlook** cannot load the add-in in this tenant; its fixes are covered by
+`web-shell/src/taskpane/outlook-reliability.integration.test.ts`.
 
 **What the live runs show is still open:**
 
@@ -372,20 +443,25 @@ Word and PowerPoint cases are to be re-run on this branch.
 
 ## Next steps
 
-1. **C — typed targets, a read-only bridge preflight, and multi-area chart sources.** Give each
+1. **Word: insert at the end of the document.** `/insert-table` and `/insert-text` accept only an
+   anchor or the selection, so "after the last paragraph" lands wherever the model guesses. Add a
+   `position=end` target, carried through contracts, compile, bridge and the prompt example.
+2. **Word: put comments in the snapshot.** The planner cannot see existing comments and sometimes
+   asks which one to reply to. The comment reader from `571685e` can feed the `<doc_state>`.
+3. **C — typed targets, a read-only bridge preflight, and multi-area chart sources.** Give each
    write kind a target schema in `contracts` (single-area A1, `slide:N`/shape id, Word anchor text,
    recipients). Add an optional `DocBridge.preflight(request)` that each bridge implements, so a
    target that does not exist is sent back for repair (fix D's path) before the user sees an
    approval card. Teach the Excel bridge to build a chart from the two-area range the model now
    emits for non-adjacent columns. This is one bridge at a time; Excel first.
-2. **E, remaining part — chat context.** Routing is fixed above. Still open: when the selection is
+4. **E, remaining part — chat context.** Routing is fixed above. Still open: when the selection is
    empty, attach the whole-document snapshot to a chat turn so a question is never answered without
    data (live run v2 invented totals from an empty cell).
-3. **F — pin the model.** Set `VITE_GE_MODEL_ID` so a server-side default-model change cannot
+5. **F — pin the model.** Set `VITE_GE_MODEL_ID` so a server-side default-model change cannot
    silently change behaviour.
-4. **H — investigate the compute timeout** on Office for the web, and **disclose the analyze
+6. **H — investigate the compute timeout** on Office for the web, and **disclose the analyze
    action schemas** the way fix A discloses write syntax.
-5. **Cross-surface reliability run.** Extend the live driver to take a surface plus the test sheet
+7. **Cross-surface reliability run.** Extend the live driver to take a surface plus the test sheet
    prompts, run each prompt 5 times, and report the pass rate at each step (route → plan → valid
    command → preflight → approval → verified). Record every live run as a replay fixture.
 

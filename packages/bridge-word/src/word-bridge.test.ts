@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { asChangeId, type ActuationRequest, type ContextRef } from '@ge/contracts';
 import type { HostEvent } from '@ge/triggers';
+import { toOoxmlPackage } from './actuate-plan.js';
 import { WordBridge } from './word-bridge.js';
 import { DocStateSnapshotSchema } from '@ge/contracts';
 import type { WordSearchHit } from './capture.js';
@@ -1184,7 +1185,7 @@ describe('WordBridge orchestration (against a fake host)', () => {
         },
         provenanceMissing: true,
       });
-      expect(host.directInserts).toEqual([{ ooxml: '<w:p/>' }]);
+      expect(host.directInserts).toEqual([{ ooxml: toOoxmlPackage('<w:p/>') }]);
     });
 
     it('inserts ooxml at a content anchor', async () => {
@@ -1196,7 +1197,7 @@ describe('WordBridge orchestration (against a fake host)', () => {
       expect(res.ok).toBe(true);
       expect(res.location).toBe('insert-ooxml');
       expect(host.directInserts).toEqual([
-        { query: 'Summary', ooxml: '<w:tbl/>', chosen: 'Summary section' },
+        { query: 'Summary', ooxml: toOoxmlPackage('<w:tbl/>'), chosen: 'Summary section' },
       ]);
     });
 

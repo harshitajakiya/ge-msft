@@ -207,6 +207,27 @@ describe('D — an invalid program is sent back for repair instead of ending the
     expect(bridge.applied).toHaveLength(1);
   });
 
+  it('keeps a new write when the same program repeats one that already landed (24a4e81 stays intact)', async () => {
+    // Regression review: the duplicate-write refusal from 24a4e81 was counted as a failed line, so
+    // the new `set Sheet2!A2` was withheld and the task ended repair_exhausted.
+    const { bridge, events } = await run([
+      cmd('set Sheet2!A1 "1"'),
+      cmd('set Sheet2!A1 "1"\nset Sheet2!A2 "2"'),
+      cmd('done'),
+    ]);
+    expect(bridge.applied.map((r) => r.params.target?.range)).toEqual(['Sheet2!A1', 'Sheet2!A2']);
+    expect(ofType(events, 'repair')).toHaveLength(0);
+    expect(events.some((e) => e.type === 'done')).toBe(true);
+  });
+
+  it('does not end as repair_exhausted when the model repeats a landed write', async () => {
+    const again = cmd('set Sheet2!A1 "1"');
+    const { bridge, events } = await run([again, again, again, again, cmd('done')]);
+    expect(bridge.applied).toHaveLength(1); // the duplicate is still refused, never applied twice
+    expect(events.some((e) => e.type === 'error' && e.code === 'repair_exhausted')).toBe(false);
+    expect(ofType(events, 'repair')).toHaveLength(0);
+  });
+
   it('withholds a valid write that shares a program with a failed line', async () => {
     const { bridge, events } = await run([
       cmd('set Sheet2!L1 "Total"\nanalyze {"action":"chart","type":"bar"}\ndone'),

@@ -2034,7 +2034,9 @@ export class AssistSession {
       // The same write already landed in this task. Re-applying it doubles the edit (a second
       // reply, "GEGE"); the usual cause is a read that still shows the old text as a tracked change.
       const error = `already applied: this exact ${resolved.request.kind} succeeded earlier in this task — do not repeat it; emit done if the task is complete`;
-      plan.results[slotIndex] = { error };
+      // A decision already made, not a malformed line: it must not withhold the program's other
+      // writes or count toward the repair budget (regression review of fix D, 2026-10-01).
+      plan.results[slotIndex] = advisory({ error });
       yield { type: 'command', turn, command, compiled: { error } };
       return;
     }
@@ -2879,7 +2881,8 @@ export class AssistSession {
     if (search) {
       await probe('context:search', { query }, () => search(query));
       for (const term of searchTerms(query)) {
-        if (out.length >= this.maxReads) break;
+        // Each search is several host round-trips on the web; the first word that matches is enough.
+        if (out.length > 0) break;
         await probe('context:search', { query: term }, () => search(term));
       }
     }

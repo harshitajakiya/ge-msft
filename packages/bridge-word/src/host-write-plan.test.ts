@@ -3,6 +3,7 @@ import { asChangeId, type ActuationRequest } from '@ge/contracts';
 import {
   planFillContentControl,
   planInsertOoxml,
+  toOoxmlPackage,
   planInsertText,
   planReplaceSelection,
 } from './actuate-plan.js';
@@ -62,7 +63,7 @@ describe('planInsertOoxml (ADR-0007 insert-ooxml)', () => {
     expect(plan).toEqual({
       matchText: 'Summary',
       anchored: true,
-      ooxml: '<w:p/>',
+      ooxml: toOoxmlPackage('<w:p/>'),
       hasOoxml: true,
     });
   });
@@ -95,5 +96,22 @@ describe('planFillContentControl (ADR-0007 fill-content-control)', () => {
       req('fill-content-control', { target: { contentControlId: '42' }, text: '' }),
     );
     expect(plan.hasText).toBe(false);
+  });
+});
+
+describe('toOoxmlPackage (live 2026-10-01: bare fragments made insertOoxml throw)', () => {
+  it('wraps a bare WordprocessingML fragment in a flat OPC package', () => {
+    const pkg = toOoxmlPackage('<w:p><w:r><w:t>Summary</w:t></w:r></w:p>');
+    expect(pkg).toMatch(/^<pkg:package /);
+    expect(pkg).toContain('pkg:name="/word/document.xml"');
+    expect(pkg).toContain('<w:body><w:p><w:r><w:t>Summary</w:t></w:r></w:p></w:body>');
+  });
+
+  it('keeps a full package unchanged and unwraps a document body', () => {
+    const full = '<pkg:package xmlns:pkg="x"><pkg:part/></pkg:package>';
+    expect(toOoxmlPackage(full)).toBe(full);
+    const doc = toOoxmlPackage('<w:document><w:body><w:p/></w:body></w:document>');
+    expect(doc).toContain('<w:body><w:p/></w:body>');
+    expect(doc.match(/<w:body>/g)).toHaveLength(1);
   });
 });

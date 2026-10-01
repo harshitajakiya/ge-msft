@@ -73,12 +73,21 @@ const CHANGE_TRACKING_MODE = { trackAll: 'TrackAll', off: 'Off' } as const;
 class FakeParagraphProxy {
   isNullObject = false;
   text = '';
-  constructor(text: string | undefined) {
+  constructor(
+    text: string | undefined,
+    private readonly seed?: WordSeed,
+    private readonly index = -1,
+  ) {
     if (text === undefined) this.isNullObject = true;
     else this.text = text;
   }
   load(_props?: string): this {
     return this;
+  }
+  /** WordApi 1.3: the following paragraph, or a null object after the last one. */
+  getNextOrNullObject(): FakeParagraphProxy {
+    const next = this.seed?.paragraphs[this.index + 1];
+    return new FakeParagraphProxy(next?.text, this.seed, this.index + 1);
   }
 }
 
@@ -98,10 +107,13 @@ class FakeSearchResult {
     return { items: [], load: () => undefined };
   }
   get paragraphs(): { getFirstOrNullObject(): FakeParagraphProxy } {
-    const containing = this.seed.paragraphs.find((p) =>
+    const index = this.seed.paragraphs.findIndex((p) =>
       p.text.toLowerCase().includes(this.text.toLowerCase()),
     );
-    return { getFirstOrNullObject: () => new FakeParagraphProxy(containing?.text) };
+    const containing = this.seed.paragraphs[index];
+    return {
+      getFirstOrNullObject: () => new FakeParagraphProxy(containing?.text, this.seed, index),
+    };
   }
   /** The tracked-change WRITE: replace the first occurrence of the anchor in the body. */
   insertText(text: string, _location: string): void {

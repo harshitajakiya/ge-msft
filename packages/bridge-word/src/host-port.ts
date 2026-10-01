@@ -399,8 +399,7 @@ export class OfficeWordHost implements WordHost {
     if (!q) return [];
     try {
       return await Word.run(async (ctx) => {
-        // `^` starts a Word special code (`^?`, `^#` match any character or digit); search literally.
-        const results = ctx.document.body.search(q.replace(/\^/g, '^^'), { matchCase });
+        const results = ctx.document.body.search(q, { matchCase });
         // Load the match text plus its surrounding paragraph (the short contextHint). `body.search`
         // → WordApi 1.1; reading a result's `paragraphs` is broadly available, but we guard the
         // whole batch in try/catch so an older/quirky host degrades to `[]` rather than throwing.
@@ -411,10 +410,19 @@ export class OfficeWordHost implements WordHost {
         const paras = live.map((r) => r.paragraphs.getFirstOrNullObject());
         for (const p of paras) p.load('text');
         await ctx.sync();
+        // The paragraphs after a hit: a heading or a short line alone does not show the content the
+        // task is about (live 2026-10-01: "Payment terms" matched, and the sentences under it never
+        // reached the model on a 66-paragraph document).
+        const following = await followingText(ctx, paras);
 
         return live.map((r, i) => {
           const para = paras[i];
-          const paraText = para && !para.isNullObject ? para.text : undefined;
+          const own = para && !para.isNullObject ? para.text : undefined;
+          // Only the added paragraphs are capped; the hit's own paragraph is kept whole.
+          const paraText =
+            own !== undefined && following[i]
+              ? `${own}\n${following[i]!.slice(0, HIT_CONTEXT_CHARS)}`
+              : own;
           const hint =
             paraText !== undefined && paraText.trim() && paraText.trim() !== r.text.trim()
               ? paraText
@@ -720,7 +728,13 @@ export class OfficeWordHost implements WordHost {
       const idx = choose(results.items.map((r) => r.text));
       const range = idx >= 0 ? results.items[idx] : undefined;
       if (!range) return { status: 'drift' };
-      range.insertOoxml(ooxml, Word.InsertLocation.after);
+      // Block content (a paragraph or table) goes after the anchor's paragraph: inserted after the
+      // matched text it merged into that sentence ("…may terminateSummary", live 2026-10-01).
+      if (/<w:(?:p|tbl)[\s>/]/.test(ooxml)) {
+        range.paragraphs.getLast().getRange('Whole').insertOoxml(ooxml, Word.InsertLocation.after);
+      } else {
+        range.insertOoxml(ooxml, Word.InsertLocation.after);
+      }
       await ctx.sync();
       return { status: 'applied', location: 'insert-ooxml' };
     });
@@ -1131,4 +1145,32 @@ function isCommentHandlers(
     'add' in value &&
     typeof (value as { add: unknown }).add === 'function'
   );
+}
+
+/** Paragraphs read after each search hit, and the context they may add. */
+const FOLLOWING_PARAGRAPHS = 2;
+const HIT_CONTEXT_CHARS = 600;
+
+/** The text of up to {@link FOLLOWING_PARAGRAPHS} paragraphs after each given paragraph. */
+async function followingText(
+  ctx: Word.RequestContext,
+  paras: readonly Word.Paragraph[],
+): Promise<string[]> {
+  const texts = paras.map(() => [] as string[]);
+  let current: Array<Word.Paragraph | undefined> = paras.map((p) =>
+    p.isNullObject ? undefined : p,
+  );
+  for (let step = 0; step < FOLLOWING_PARAGRAPHS; step++) {
+    const next = current.map((p) =>
+      p && typeof p.getNextOrNullObject === 'function' ? p.getNextOrNullObject() : undefined,
+    );
+    if (next.every((n) => n === undefined)) break;
+    for (const n of next) n?.load('text');
+    await ctx.sync();
+    current = next.map((n) => (n && !n.isNullObject ? n : undefined));
+    current.forEach((n, i) => {
+      if (n && n.text.trim()) texts[i]!.push(n.text.trim());
+    });
+  }
+  return texts.map((t) => t.join('\n'));
 }

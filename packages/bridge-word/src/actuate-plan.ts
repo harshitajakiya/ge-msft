@@ -144,9 +144,33 @@ export interface InsertOoxmlPlan {
   hasOoxml: boolean;
 }
 
+/**
+ * Word's `insertOoxml` needs a flat OPC package. A bare WordprocessingML fragment (`<w:p>…</w:p>`,
+ * which is what the model writes) made the host throw, and every insert ended `outcome_unknown`
+ * (live 2026-10-01). Wrap a fragment in the minimal package; pass a full package through unchanged.
+ */
+export function toOoxmlPackage(ooxml: string): string {
+  const xml = ooxml.trim();
+  if (!xml || /<pkg:package[\s>]/.test(xml)) return ooxml;
+  const body = /<w:body[\s>]/.test(xml)
+    ? xml.replace(/^[\s\S]*?<w:body[^>]*>/, '').replace(/<\/w:body>[\s\S]*$/, '')
+    : xml;
+  return [
+    '<pkg:package xmlns:pkg="http://schemas.microsoft.com/office/2006/xmlPackage">',
+    '<pkg:part pkg:name="/_rels/.rels" pkg:contentType="application/vnd.openxmlformats-package.relationships+xml">',
+    '<pkg:xmlData><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+    '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>',
+    '</Relationships></pkg:xmlData></pkg:part>',
+    '<pkg:part pkg:name="/word/document.xml" pkg:contentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml">',
+    '<pkg:xmlData><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">',
+    `<w:body>${body}</w:body></w:document></pkg:xmlData></pkg:part>`,
+    '</pkg:package>',
+  ].join('');
+}
+
 export function planInsertOoxml(req: ActuationRequest): InsertOoxmlPlan {
   const p = req.params;
-  const ooxml = p.ooxml ?? '';
+  const ooxml = toOoxmlPackage(p.ooxml ?? '');
   return {
     ...(p.target?.matchText ? { matchText: p.target.matchText } : {}),
     ...(p.target?.contextHint ? { contextHint: p.target.contextHint } : {}),

@@ -1,4 +1,5 @@
 import { StrictMode } from 'react';
+import { getOfficeLoginHint } from './office-login-hint.js';
 import { createRoot, type Root } from 'react-dom/client';
 import {
   filterManifestForReleaseProfile,
@@ -173,24 +174,6 @@ function listenForAskSelectionSeeds(surface: Surface, controller: PanelControlle
     };
   } catch {
     // Some hosts disable BroadcastChannel; the cold-pane and storage-event paths still work.
-  }
-}
-
-async function getOfficeLoginHint(): Promise<string | undefined> {
-  try {
-    const officeAuth = (
-      globalThis as {
-        Office?: {
-          auth?: {
-            getAuthContext?: () => Promise<{ userPrincipalName?: string | null }>;
-          };
-        };
-      }
-    ).Office?.auth;
-    const upn = (await officeAuth?.getAuthContext?.())?.userPrincipalName?.trim();
-    return upn || undefined;
-  } catch {
-    return undefined;
   }
 }
 
