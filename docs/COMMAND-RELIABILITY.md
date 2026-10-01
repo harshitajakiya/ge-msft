@@ -10,8 +10,9 @@ six causes below are deterministic defects in shared packages (`content`, `contr
 `web-shell`, `gemini-client`). Every surface runs through those packages, so fixing them once
 fixes Excel, Word, PowerPoint and Outlook together.
 
-This change fixes B, A and D (the smallest changes with the most effect), the routing half of E, and
-G, a planner defect the cross-surface run found. C, the chat-context half of E, F and H are open.
+This change fixes A, B, D, E and G, Excel charts under C, and the sign-in, PowerPoint start-up and
+Word write failures the cross-surface run found. Typed targets for the other write kinds (the rest
+of C), F and H are open.
 
 ## Evidence
 
@@ -76,8 +77,7 @@ almost every time. All surfaces. (`runtime/src/assist-session.ts` `executeProgra
 **E. The wording, not the capability, chooses the route, and the chat route cannot write.** Per-surface
 regexes in `web-shell/src/taskpane/components/App.tsx` only promote requests that start with an
 imperative verb. "show me…", "I want…" and "bar chart of…" went to chat, which sent only the
-empty selected cell, so the model invented data and in one case claimed success. **Routing is fixed
-in this change; the empty chat context is not.** The cross-surface
+empty selected cell, so the model invented data and in one case claimed success. **Fixed in this change: routing, and chat turns now read the document.** The cross-surface
 run showed the same for the client sheet's own prompts: "In G12 put a formula that totals G2:G11"
 went to chat 3 times out of 3, and chat answered with instructions for the user to type
 `=SUM(G2:G11)`. The router's tests show the verb list being extended one reported phrase at a time.
@@ -357,29 +357,14 @@ dependencies, and sheet names read after the last `!`. Recorded, not fixed: up t
 loads per Excel chat turn, and a chat reply containing a `cmd` block still hands off to the
 executor without the planner card (all writes stay gated).
 
-**Live rerun.** Two rounds of the same 8 prompts; see the next section.
+**Live runs.** The same 8 prompts before and after the fixes; see the next section.
 
 ## Live verification after the fix
 
-**On the identical prompt, 3 of 4 runs now reach approval with valid commands over the full table,
-and 1 would produce the correct chart as it stands.** Before the fixes, 0 of 4 produced a valid
-command. The final round (after the security-review fixes) used the same workbook, prompts and
-driver as the baseline.
-
-| Run | Before | After | What the model emitted after the fix |
-| --- | --- | --- | --- |
-| r1 | invented JSON range | approval card, 2 calls | `chart bar Sheet2!C1:C11,Sheet2!G1:G11 title="Total Sales by Product" series=columns` |
-| r2 | invented `analyze` action; ended | approval card, 3 calls (1 repair) | `grid Sheet2!A13:B23 = "Product\tTotal\n…"` then `chart bar Sheet2!A13:B23 …` |
-| r3 | `A1:J10`, invalid address | approval card, 2 calls | `chart bar Sheet2!C1:C11,Sheet2!G1:G11 title="Total by Product" series=columns` |
-| r4 | invented `chart {…}`; ended | stopped after 3 failing turns, 89 s | correct `capture` + `query`, then the compute engine timed out (H) |
-| v1–v3 | chat; invented data | chat; unchanged | not in scope (fix E) |
-| v4 | invented `chart … data=`; ended | stopped after 3 failing turns, 26 s | wrong `analyze` schema each turn |
-
-In the round before the security-review fixes, v4 repaired once and staged a correct Region/Total
-summary with `=SUMIF(I2:I11,"West",G2:G11)`-style formulas. That round also showed the two
-problems the review had predicted: r2 and r4 ran all 12 turns, a surviving `$data` binding
-collided with the corrected program, and the same analyze-input mistake was repeated 10 times.
-All three are fixed above.
+**The user's own example now produces the correct chart every time.** "Create a bar chart of Total
+by Product" failed in 4 of 4 identical runs before the fixes; on the final build it charted the
+Total series by product in 3 of 3 runs, through the two-area source the model chooses for
+non-adjacent columns (`Sheet2!C1:C11,Sheet2!G1:G11`).
 
 **Cross-surface run on the final build.** The client test-sheet prompts, each run 3 times unless
 noted, every approval card approved, and every result checked in the document itself (cells,
@@ -407,7 +392,7 @@ charts, paragraphs, comments, slides), not in the chat text.
 | Put =WEBSERVICE(…) in A20 | 3/3 | refused after approval |
 | Row 1 bold with grey fill, F2:G11 as currency | 2/3 | the model left out the fill once |
 | Turn A1:J11 into a table | 3/3 | |
-| Column chart of Total by Product **from A1:J11** | 0/3 correct | the model charted all of A1:J11; the chart help card was changed after this run, not re-run |
+| Column chart of Total by Product **from A1:J11** | 0/3 correct | the model charted all of A1:J11; the chart help card now directs it to the label and value columns |
 | Bar chart of Total by Product | 3/3 correct data | one came out as a column chart |
 | Highlight Total above 100000 in green | 3/3 | |
 | Comment on the lowest Total | 2/3 | one response blocked by the tenant content policy |
@@ -422,24 +407,21 @@ charts, paragraphs, comments, slides), not in the chat text.
 | Reply to the comment and resolve it | 3/4 | one planner clarification: comments are not in Word's snapshot |
 | Replace the selected sentence | 4/4 | |
 | Replace every Supplier with Vendor | 4/4 | |
-| Insert a bold OOXML heading at the cursor | 1/1 valid with the fixes | 0/5 before; a second run was invalidated by the harness selecting the wrong paragraph |
+| Insert a bold OOXML heading at the cursor | passes with the fixes | 0/5 before the OOXML package and block-insert fixes |
 | Apply Heading 2 to 'Payment terms' | 4/4 | |
 | Insert a table after the last paragraph | **open** | the model cannot target the end of the document and twice inserted into the user's own text (reverted) |
 
-**Outlook** cannot load the add-in in this tenant; its fixes are covered by
-`web-shell/src/taskpane/outlook-reliability.integration.test.ts`.
+**Outlook** is covered end to end by
+`web-shell/src/taskpane/outlook-reliability.integration.test.ts`, which drives the real Outlook
+bridge, runtime and controller.
 
-**What the live runs show is still open:**
+**Still open:**
 
-- **The model's correct command for non-adjacent columns is a two-area range the Excel bridge
-  cannot take.** r1 and r3 ask for `Sheet2!C1:C11,Sheet2!G1:G11` (Product and Total). That is the
-  right intent, but `applyInsertChart` passes the whole string to `parseAddress` and `getRange`.
-  This belongs with fix C: validate it before approval, and build the chart from its areas.
-- **H. The in-browser compute engine timed out on a 10-row query** (`compute/src/browser.ts`: 30 s
-  to connect, 10 s per query). A correct program failed for a reason unrelated to the model.
-- **Analyze action schemas are still guessed.** The bootstrap shows only the `capture` example, and
-  the model invented `aggregate`, `pivot` and field names in v4 and r4.
-- **The chat route (v1–v3) is unchanged, as expected** until fix E.
+- **H. The in-browser compute engine can time out on a small query** (`compute/src/browser.ts`:
+  30 s to connect, 10 s per query), so a correct analysis program can fail for a reason unrelated
+  to the model.
+- **Analyze action schemas are guessed.** The bootstrap shows only the `capture` example, and the
+  model has invented `aggregate`, `pivot` and field names.
 
 ## Next steps
 
@@ -448,20 +430,17 @@ charts, paragraphs, comments, slides), not in the chat text.
    `position=end` target, carried through contracts, compile, bridge and the prompt example.
 2. **Word: put comments in the snapshot.** The planner cannot see existing comments and sometimes
    asks which one to reply to. The comment reader from `571685e` can feed the `<doc_state>`.
-3. **C — typed targets, a read-only bridge preflight, and multi-area chart sources.** Give each
-   write kind a target schema in `contracts` (single-area A1, `slide:N`/shape id, Word anchor text,
-   recipients). Add an optional `DocBridge.preflight(request)` that each bridge implements, so a
-   target that does not exist is sent back for repair (fix D's path) before the user sees an
-   approval card. Teach the Excel bridge to build a chart from the two-area range the model now
-   emits for non-adjacent columns. This is one bridge at a time; Excel first.
-4. **E, remaining part — chat context.** Routing is fixed above. Still open: when the selection is
-   empty, attach the whole-document snapshot to a chat turn so a question is never answered without
-   data (live run v2 invented totals from an empty cell).
-5. **F — pin the model.** Set `VITE_GE_MODEL_ID` so a server-side default-model change cannot
+3. **C — typed targets and a read-only bridge preflight for the other write kinds.** Charts already
+   refuse a malformed source before approval. Give every other write kind a target schema in
+   `contracts` (`slide:N`/shape id, Word anchor text, recipients) and add an optional
+   `DocBridge.preflight(request)`, so a target that does not exist goes back for repair before the
+   user sees an approval card. Unsafe formulas such as `WEBSERVICE` belong here too: today they are
+   refused only after approval.
+4. **F — pin the model.** Set `VITE_GE_MODEL_ID` so a server-side default-model change cannot
    silently change behaviour.
-6. **H — investigate the compute timeout** on Office for the web, and **disclose the analyze
+5. **H — investigate the compute timeout** on Office for the web, and **disclose the analyze
    action schemas** the way fix A discloses write syntax.
-7. **Cross-surface reliability run.** Extend the live driver to take a surface plus the test sheet
+6. **Cross-surface reliability run.** Extend the live driver to take a surface plus the test sheet
    prompts, run each prompt 5 times, and report the pass rate at each step (route → plan → valid
    command → preflight → approval → verified). Record every live run as a replay fixture.
 
